@@ -1,0 +1,56 @@
+# Local-only infrastructure stand-ins. Nothing here is deployed — see infra/ for that.
+#
+# dynamodb-local backs the single table (README "Getting started" still documents
+# `dotnet run scripts/dev-table.cs` to create it once this is up).
+#
+# minio is an S3-compatible object store that Koleksi.Infrastructure's S3MediaStorage
+# talks to directly when Koleksi:Media:ServiceUrl is set (appsettings.Development.json
+# sets it by default) — real presigned PUTs and real signature verification, just against
+# MinIO instead of AWS. The root user/password below are AWS's own documentation
+# placeholders, reused deliberately: they are also what BuildS3Client in
+# InfrastructureServiceCollectionExtensions.cs signs local requests with, so the two only
+# work because they're kept identical. Change one, change the other.
+#
+# minio-init creates the two buckets appsettings.Development.json's Media section names
+# and exits; `docker compose up -d` runs it once per bucket-creation (mc mb --ignore-existing
+# is a no-op if they already exist) rather than once ever.
+
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: koleksi-dynamodb-local
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+
+  minio:
+    image: minio/minio:latest
+    container_name: koleksi-minio
+    environment:
+      MINIO_ROOT_USER: AKIAIOSFODNN7EXAMPLE
+      MINIO_ROOT_PASSWORD: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"   # S3 API — matches Koleksi:Media:ServiceUrl
+      - "9001:9001"   # Web console, http://localhost:9001
+    volumes:
+      - koleksi-minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY; do sleep 1; done;
+      mc mb --ignore-existing local/koleksi-dev-media;
+      mc mb --ignore-existing local/koleksi-dev-identity;
+      mc anonymous set download local/koleksi-dev-media;
+      "
+      # koleksi-dev-media is set to anonymous-download, not koleksi-dev-identity: it stands
+      # in for the CDN-fronted public bucket, whose objects are meant to be fetched by a
+      # bare GET. The identity bucket stays private, same as in a deployed stage — nothing
+      # ever calls S3MediaStorage.PublicUrl on it, only presigned PUT/HEAD.
+
+volumes:
+  koleksi-minio-data:

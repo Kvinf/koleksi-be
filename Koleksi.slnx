@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Koleksi.Api/Koleksi.Api.csproj" />
+    <Project Path="src/Koleksi.Application/Koleksi.Application.csproj" />
+    <Project Path="src/Koleksi.Domain/Koleksi.Domain.csproj" />
+    <Project Path="src/Koleksi.Infrastructure/Koleksi.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Koleksi.Api.Tests/Koleksi.Api.Tests.csproj" />
+    <Project Path="tests/Koleksi.Domain.Tests/Koleksi.Domain.Tests.csproj" />
+    <Project Path="tests/Koleksi.Infrastructure.Tests/Koleksi.Infrastructure.Tests.csproj" />
+    <Project Path="tests/Koleksi.Infrastructure.IntegrationTests/Koleksi.Infrastructure.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,19 @@
+<Project>
+
+  <!-- Inherit every solution-wide setting, then relax only what test code needs. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+
+    <!--
+      CA1707 forbids underscores in member names. Test methods are the documented
+      exception: "The_seller_cannot_bid_on_their_own_lot" reads as a sentence in the
+      failure output, which is the whole point of a test name. The rule stays on
+      everywhere else.
+    -->
+    <NoWarn>$(NoWarn);CA1707</NoWarn>
+  </PropertyGroup>
+
+</Project>

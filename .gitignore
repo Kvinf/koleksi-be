@@ -1,0 +1,22 @@
+# ─── Build output ─────────────────────────────────────────────────────────────
+bin/
+obj/
+publish/
+
+# ─── Local configuration ──────────────────────────────────────────────────────
+# Never commit these. appsettings.Development.json is committed on purpose because it
+# holds only identifiers; anything that is actually secret belongs in Secrets Manager or
+# in user-secrets, never in a file the repository tracks.
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+*.user
+
+# ─── Editor and OS ────────────────────────────────────────────────────────────
+.vs/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+Thumbs.db
+.DS_Store

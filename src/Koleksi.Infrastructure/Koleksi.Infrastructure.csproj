@@ -1,0 +1,38 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Koleksi.Application\Koleksi.Application.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Amazon.Extensions.CognitoAuthentication" Version="3.1.5" />
+    <PackageReference Include="AWSSDK.CognitoIdentityProvider" Version="4.0.103.2" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="4.0.103.1" />
+    <PackageReference Include="AWSSDK.Extensions.NETCore.Setup" Version="4.0.100.8" />
+    <PackageReference Include="AWSSDK.S3" Version="4.0.102.1" />
+    <PackageReference Include="AWSSDK.SecretsManager" Version="4.0.100.8" />
+    <PackageReference Include="AWSSDK.SimpleEmailV2" Version="4.0.101" />
+    <PackageReference Include="AWSSDK.SimpleNotificationService" Version="4.0.100.9" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.11" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    Key composition, cursor encoding, and webhook signature verification are internal on
+    purpose: nothing outside this assembly may compose a DynamoDB key. They are also the
+    parts most worth testing, so the test assembly is granted access rather than the types
+    being widened to public and becoming API surface anyone can depend on.
+  -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Koleksi.Infrastructure.Tests" />
+    <InternalsVisibleTo Include="Koleksi.Infrastructure.IntegrationTests" />
+  </ItemGroup>
+
+</Project>
