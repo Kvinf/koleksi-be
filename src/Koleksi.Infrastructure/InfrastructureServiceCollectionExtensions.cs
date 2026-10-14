@@ -1,4 +1,5 @@
 using Amazon;
+using Amazon.ApiGatewayManagementApi;
 using Amazon.CognitoIdentityProvider;
 using Amazon.DynamoDBv2;
 using Amazon.Runtime;
@@ -7,11 +8,14 @@ using Amazon.SecretsManager;
 using Amazon.SimpleEmailV2;
 using Amazon.SimpleNotificationService;
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Standing;
 using Koleksi.Infrastructure.Identity;
 using Koleksi.Infrastructure.Media;
 using Koleksi.Infrastructure.Notifications;
+using Koleksi.Infrastructure.Delivery;
 using Koleksi.Infrastructure.Payments;
 using Koleksi.Infrastructure.Persistence;
+using Koleksi.Infrastructure.Realtime;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Koleksi.Infrastructure;
@@ -50,7 +54,9 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton(options.Media);
         services.AddSingleton(options.Email);
         services.AddSingleton(options.Payment);
-
+        services.AddSingleton(options.Delivery);
+        services.AddSingleton(options.Realtime);
+        services.AddSingleton(options.Security);
         services.AddSingleton<IAmazonDynamoDB>(_ => BuildDynamoClient(options));
         services.AddSingleton<IAmazonS3>(_ => BuildS3Client(options));
         services.AddSingleton<IAmazonSecretsManager>(_ => BuildSecretsClient(options));
@@ -60,14 +66,30 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IListingRepository, DynamoListingRepository>();
         services.AddSingleton<IAuctionRepository, DynamoAuctionRepository>();
         services.AddSingleton<IOfferRepository, DynamoOfferRepository>();
+        services.AddSingleton<IConversationRepository, DynamoConversationRepository>();
         services.AddSingleton<IOrderRepository, DynamoOrderRepository>();
+        services.AddSingleton<IOrderSweepBackfill, DynamoOrderRepository>();
+        services.AddSingleton<IListingHoldStore, DynamoListingHoldStore>();
+        services.AddSingleton<IAccountStandingRepository, DynamoAccountStandingRepository>();
+        services.AddSingleton<IPayoutRepository, DynamoPayoutRepository>();
+        services.AddSingleton<IPaymentOrphanStore, DynamoPaymentOrphanStore>();
         services.AddSingleton<ICartRepository, DynamoCartRepository>();
-        services.AddSingleton<IListingSearchIndex, DynamoListingSearchIndex>();
+        services.AddSingleton<IWatchlistRepository, DynamoWatchlistRepository>();
+        services.AddSingleton<DynamoListingSearchIndex>();
+        services.AddSingleton<IListingSearchIndex>(sp => sp.GetRequiredService<DynamoListingSearchIndex>());
+        services.AddSingleton<IListingSuggestionIndex>(sp => sp.GetRequiredService<DynamoListingSearchIndex>());
         services.AddSingleton<ICategoryRepository, SeededCategoryRepository>();
         services.AddSingleton<IIdempotencyStore, DynamoIdempotencyStore>();
         services.AddSingleton<IProfileRepository, DynamoProfileRepository>();
+        services.AddSingleton<IPublicProfileRepository, DynamoPublicProfileRepository>();
+        services.AddSingleton<IReviewRepository, DynamoReviewRepository>();
+        services.AddSingleton<DynamoOtpChallengeStore>();
+        services.AddSingleton<IVerificationThrottle, DynamoVerificationThrottle>();
         services.AddSingleton<IPhoneVerificationService, SnsPhoneVerificationService>();
         services.AddSingleton<IEmailVerificationService, SesEmailVerificationService>();
+
+        services.AddSingleton<IRealtimeTicketStore, DynamoRealtimeTicketStore>();
+        AddRealtimeBroadcaster(services, options);
 
         services.AddSingleton<IMediaStorage, S3MediaStorage>();
 
@@ -76,10 +98,10 @@ public static class InfrastructureServiceCollectionExtensions
         // compromise of this service inherits nothing it could do to the user pool.
         services.AddSingleton<IAmazonCognitoIdentityProvider>(_ => new AmazonCognitoIdentityProviderClient(
             new AnonymousAWSCredentials(),
-            new AmazonCognitoIdentityProviderConfig
+            Bounded(new AmazonCognitoIdentityProviderConfig
             {
                 RegionEndpoint = RegionEndpoint.GetBySystemName(options.Cognito.ResolvedRegion),
-            }));
+            })));
 
         // Google sign-in's authorization-code exchange is a plain OAuth token-endpoint POST,
         // not a Cognito SDK call, so it needs an ordinary HttpClient. Factory-managed even
@@ -95,7 +117,96 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<PaymentSecret>();
         services.AddSingleton<IPaymentGateway, PaymentGateway>();
 
+        // Paying sellers out and learning that a parcel arrived are calls to outside providers. Payout shares
+        // the payment gateway's merchant configuration; courier tracking is a separate provider that has not
+        // been chosen. Both answer honestly "not configured" until their adapters exist (see each class), and
+        // the development host swaps in local simulators (Program.cs).
+        services.AddSingleton<IEscrowPayout, GatewayEscrowPayout>();
+        AddDeliveryProvider(services, options.Delivery);
+
         return services;
+    }
+
+    /// <summary>
+    /// Chooses how live events reach browsers: through API Gateway's WebSocket API when its
+    /// management endpoint is configured, and nowhere otherwise.
+    /// </summary>
+    /// <remarks>
+    /// The development host replaces this with an in-process hub (see <c>Program.cs</c>), which
+    /// is why "nowhere" is a registered no-op rather than a missing service.
+    /// </remarks>
+    /// <summary>
+    /// Wires the courier-tracking provider named in <c>Koleksi:Delivery:Provider</c>. <c>none</c> (the default) keeps
+    /// the "buyer confirms receipt" behaviour. A name that is not registered here stops the host at start, with the
+    /// list of names that are, rather than quietly running with no tracking.
+    /// </summary>
+    /// <remarks>
+    /// Adding a provider: write its <see cref="IDeliveryWebhookProvider"/> (and an <see cref="IDeliveryTracker"/> if it
+    /// can also be asked or must be told about each parcel), then add a case below. See
+    /// <c>docs/delivery-providers.md</c> for the checklist.
+    /// </remarks>
+    private static void AddDeliveryProvider(IServiceCollection services, DeliveryOptions delivery)
+    {
+        switch (delivery.Provider.Trim().ToLowerInvariant())
+        {
+            case DeliveryOptions.None:
+                services.AddSingleton<IDeliveryTracker, NotConfiguredDeliveryTracker>();
+                break;
+
+            case SignedJsonDeliveryWebhookProvider.ProviderName:
+                services.AddSingleton<IDeliveryWebhookSecret, DeliveryWebhookSecret>();
+                services.AddSingleton<IDeliveryWebhookProvider, SignedJsonDeliveryWebhookProvider>();
+                services.AddSingleton<IDeliveryTracker, PushOnlyDeliveryTracker>();
+                break;
+
+            default:
+                throw new InvalidOperationException(
+                    $"Koleksi:Delivery:Provider '{delivery.Provider}' is not a known provider. "
+                    + $"Known: {DeliveryOptions.None}, {SignedJsonDeliveryWebhookProvider.ProviderName}.");
+        }
+    }
+
+    private static void AddRealtimeBroadcaster(IServiceCollection services, KoleksiOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.Realtime.ManagementUrl))
+        {
+            services.AddSingleton<IRealtimeBroadcaster, NullRealtimeBroadcaster>();
+            return;
+        }
+
+        services.AddSingleton<IAmazonApiGatewayManagementApi>(_ => new AmazonApiGatewayManagementApiClient(
+            Bounded(new AmazonApiGatewayManagementApiConfig
+            {
+                ServiceURL = options.Realtime.ManagementUrl,
+                AuthenticationRegion = string.IsNullOrWhiteSpace(options.Region)
+                    ? "ap-southeast-3"
+                    : options.Region,
+            })));
+
+        services.AddSingleton<IRealtimeBroadcaster, ApiGatewayRealtimeBroadcaster>();
+    }
+
+    /// <summary>Per-attempt request timeout for every AWS SDK client but S3.</summary>
+    internal static readonly TimeSpan SdkCallTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>S3 gets a little longer: its tail latency is wider than Dynamo's.</summary>
+    internal static readonly TimeSpan S3CallTimeout = TimeSpan.FromSeconds(8);
+
+    /// <summary>Retries after the first attempt. The SDK default is 4 (5 attempts).</summary>
+    internal const int SdkMaxErrorRetry = 2;
+
+    /// <summary>
+    /// Bounds a client so a slow or unreachable dependency cannot hold a request until the
+    /// Lambda's 25 s limit (API Gateway cuts at 30 s). The SDK default is a 100 s timeout and
+    /// 4 retries, which once left a listing create hanging for 191 s (QA N-06).
+    /// </summary>
+    internal static TConfig Bounded<TConfig>(TConfig config, TimeSpan? timeout = null)
+        where TConfig : ClientConfig
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        config.Timeout = timeout ?? SdkCallTimeout;
+        config.MaxErrorRetry = SdkMaxErrorRetry;
+        return config;
     }
 
     /// <summary>
@@ -122,7 +233,7 @@ public static class InfrastructureServiceCollectionExtensions
         {
             return new AmazonDynamoDBClient(
                 LocalDevelopmentCredentials,
-                new AmazonDynamoDBConfig
+                Bounded(new AmazonDynamoDBConfig
                 {
                     ServiceURL = options.Dynamo.ServiceUrl,
 
@@ -131,10 +242,10 @@ public static class InfrastructureServiceCollectionExtensions
                     AuthenticationRegion = string.IsNullOrWhiteSpace(options.Region)
                         ? "ap-southeast-3"
                         : options.Region,
-                });
+                }));
         }
 
-        var config = new AmazonDynamoDBConfig();
+        var config = Bounded(new AmazonDynamoDBConfig());
         if (!string.IsNullOrWhiteSpace(options.Region))
         {
             config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);
@@ -174,7 +285,7 @@ public static class InfrastructureServiceCollectionExtensions
         {
             return new AmazonS3Client(
                 LocalDevelopmentCredentials,
-                new AmazonS3Config
+                Bounded(new AmazonS3Config
                 {
                     ServiceURL = options.Media.ServiceUrl,
 
@@ -185,10 +296,10 @@ public static class InfrastructureServiceCollectionExtensions
                     AuthenticationRegion = string.IsNullOrWhiteSpace(options.Region)
                         ? "ap-southeast-3"
                         : options.Region,
-                });
+                }, S3CallTimeout));
         }
 
-        var config = new AmazonS3Config();
+        var config = Bounded(new AmazonS3Config(), S3CallTimeout);
         if (!string.IsNullOrWhiteSpace(options.Region))
         {
             config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);
@@ -199,7 +310,7 @@ public static class InfrastructureServiceCollectionExtensions
 
     private static AmazonSecretsManagerClient BuildSecretsClient(KoleksiOptions options)
     {
-        var config = new AmazonSecretsManagerConfig();
+        var config = Bounded(new AmazonSecretsManagerConfig());
         if (!string.IsNullOrWhiteSpace(options.Region))
         {
             config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);
@@ -210,7 +321,7 @@ public static class InfrastructureServiceCollectionExtensions
 
     private static AmazonSimpleNotificationServiceClient BuildSnsClient(KoleksiOptions options)
     {
-        var config = new AmazonSimpleNotificationServiceConfig();
+        var config = Bounded(new AmazonSimpleNotificationServiceConfig());
         if (!string.IsNullOrWhiteSpace(options.Region))
         {
             config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);
@@ -221,7 +332,7 @@ public static class InfrastructureServiceCollectionExtensions
 
     private static AmazonSimpleEmailServiceV2Client BuildSesClient(KoleksiOptions options)
     {
-        var config = new AmazonSimpleEmailServiceV2Config();
+        var config = Bounded(new AmazonSimpleEmailServiceV2Config());
         if (!string.IsNullOrWhiteSpace(options.Region))
         {
             config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);

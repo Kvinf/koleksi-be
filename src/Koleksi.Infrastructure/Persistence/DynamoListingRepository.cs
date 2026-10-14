@@ -149,6 +149,13 @@ internal sealed class DynamoListingRepository(IAmazonDynamoDB dynamo, DynamoOpti
         }
     }
 
+    /// <summary>
+    /// The most queries one <see cref="ListBySellerAsync"/> call makes while looking past rows
+    /// that are not listings. Generous for a normal partition and a hard stop for a pathological
+    /// one; a call that stops here returns a short page with a cursor, so nothing is lost.
+    /// </summary>
+    private const int MaxSellerQueryRounds = 10;
+
     public async Task<Page<Listing>> ListBySellerAsync(
         string sellerId, ListingStatus? status, string? cursor, int limit, CancellationToken ct)
     {
@@ -169,31 +176,60 @@ internal sealed class DynamoListingRepository(IAmazonDynamoDB dynamo, DynamoOpti
             values[":skPrefix"] = Attr.S(DynamoTable.SellerSkPrefix(wanted.ToString()));
         }
 
-        var response = await dynamo.QueryAsync(
-            new QueryRequest
-            {
-                TableName = options.TableName,
-                IndexName = DynamoTable.SellerIndex,
-                KeyConditionExpression = keyCondition,
-                ExpressionAttributeValues = values,
-                ExclusiveStartKey = DynamoCursor.Decode(cursor),
-                Limit = limit,
+        // The seller index is shared: listings, received offers, orders and conversations all
+        // carry gsi_seller_* keys, told apart only by the sort key's prefix. With no status to
+        // narrow by there is no key condition that selects listings alone (their statuses sort
+        // on either side of CONV#, OFFER# and ORDER#), so the rows are filtered by type instead.
+        // Without this, the first non-listing row in a seller's partition made ToDomain throw
+        // and took their whole dashboard down.
+        values[":listing"] = Attr.S(ListingItem.TypeName);
 
-                // Newest first: ids are time-ordered, so descending on the sort key is
-                // descending by creation time within a status.
-                ScanIndexForward = false,
-            },
-            ct).ConfigureAwait(false);
-
-        var listings = new List<Listing>(response.Items?.Count ?? 0);
-        foreach (var item in response.Items ?? [])
+        var names = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            listings.Add(ListingItem.ToDomain(item));
+            ["#entity"] = DynamoTable.EntityType,
+        };
+
+        var listings = new List<Listing>();
+        var startKey = DynamoCursor.Decode(cursor);
+        var rounds = 0;
+
+        // A filter runs after Limit, so one query can come back short — or empty — while more
+        // listings lie further on. Keep reading until the page is full or the partition is
+        // exhausted. Each round asks only for what is still missing, so the key a round ends
+        // on is exactly where the page ends and is a correct cursor to resume from.
+        do
+        {
+            var response = await dynamo.QueryAsync(
+                new QueryRequest
+                {
+                    TableName = options.TableName,
+                    IndexName = DynamoTable.SellerIndex,
+                    KeyConditionExpression = keyCondition,
+                    FilterExpression = "#entity = :listing",
+                    ExpressionAttributeNames = names,
+                    ExpressionAttributeValues = values,
+                    ExclusiveStartKey = startKey,
+                    Limit = limit - listings.Count,
+
+                    // Newest first: ids are time-ordered, so descending on the sort key is
+                    // descending by creation time within a status.
+                    ScanIndexForward = false,
+                },
+                ct).ConfigureAwait(false);
+
+            foreach (var item in response.Items ?? [])
+            {
+                listings.Add(ListingItem.ToDomain(item));
+            }
+
+            startKey = response.LastEvaluatedKey is { Count: > 0 } ? response.LastEvaluatedKey : null;
+            rounds++;
         }
+        while (listings.Count < limit && startKey is not null && rounds < MaxSellerQueryRounds);
 
         return new Page<Listing>(
             listings,
-            DynamoCursor.Encode(response.LastEvaluatedKey),
+            DynamoCursor.Encode(startKey),
 
             // The dashboard shows "12 active" from a maintained counter, not from a count
             // of the page in hand. Reporting the page length here would render "12 of 12"
@@ -237,6 +273,13 @@ internal sealed class DynamoListingRepository(IAmazonDynamoDB dynamo, DynamoOpti
             // The listing is gone. A view of something that no longer exists is not an
             // error worth surfacing to the reader.
         }
+        catch (TransactionConflictException)
+        {
+            // Someone saved or unsaved this listing in the very instant of the view (the
+            // watchlist moves the watcher count in a transaction on this same row, and
+            // DynamoDB turns a plain write away while one is in flight). A lost view is not
+            // worth a failed page load, and the doc above already says it is not worth a retry.
+        }
     }
 
     /// <summary>
@@ -268,6 +311,90 @@ internal sealed class DynamoListingRepository(IAmazonDynamoDB dynamo, DynamoOpti
         return response.Item is { Count: > 0 } item
             ? item.GetStringOrNull(BrowseProjectionItem.SellerUsernameAttr)
             : null;
+    }
+
+    /// <summary>Most pages a count will walk; at 1 MB a page this is far beyond any seller's real catalogue.</summary>
+    private const int MaxCountRounds = 20;
+
+    public async Task<int> CountBySellerAsync(string sellerId, ListingStatus status, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
+
+        // Status leads the sort key, so this is a key-condition prefix: it reads only index keys
+        // for that status and never a listing body. Offers, orders and conversations share the
+        // partition but sort under other prefixes, so none of them is counted.
+        var total = 0;
+        Dictionary<string, AttributeValue>? startKey = null;
+
+        for (var round = 0; round < MaxCountRounds; round++)
+        {
+            var response = await dynamo.QueryAsync(
+                new QueryRequest
+                {
+                    TableName = options.TableName,
+                    IndexName = DynamoTable.SellerIndex,
+                    KeyConditionExpression = $"{DynamoTable.SellerPk} = :pk AND begins_with({DynamoTable.SellerSk}, :prefix)",
+                    ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                    {
+                        [":pk"] = Attr.S(DynamoTable.SellerPkValue(sellerId)),
+                        [":prefix"] = Attr.S(DynamoTable.SellerSkPrefix(status.ToString())),
+                    },
+                    Select = Select.COUNT,
+                    ExclusiveStartKey = startKey,
+                },
+                ct).ConfigureAwait(false);
+
+            total += response.Count ?? 0;
+            startKey = response.LastEvaluatedKey is { Count: > 0 } ? response.LastEvaluatedKey : null;
+            if (startKey is null)
+            {
+                break;
+            }
+        }
+
+        return total;
+    }
+
+    public async Task<IReadOnlyDictionary<string, string>> FindSellerIdsAsync(
+        IReadOnlyCollection<string> listingIds, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(listingIds);
+
+        var found = new Dictionary<string, string>(StringComparer.Ordinal);
+        var distinct = listingIds.Distinct(StringComparer.Ordinal).ToList();
+
+        // BatchGetItem takes at most 100 keys; a browse page is at most 48.
+        for (var offset = 0; offset < distinct.Count; offset += 100)
+        {
+            var pending = new Dictionary<string, KeysAndAttributes>(StringComparer.Ordinal)
+            {
+                [options.TableName] = new KeysAndAttributes
+                {
+                    Keys = [.. distinct.Skip(offset).Take(100).Select(KeyOf)],
+                    ProjectionExpression = "#id, #seller",
+                    ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["#id"] = "id",
+                        ["#seller"] = "sellerId",
+                    },
+                },
+            };
+
+            for (var round = 0; round < 4 && pending.Count > 0; round++)
+            {
+                var response = await dynamo.BatchGetItemAsync(
+                    new BatchGetItemRequest { RequestItems = pending }, ct).ConfigureAwait(false);
+
+                foreach (var item in response.Responses.GetValueOrDefault(options.TableName) ?? [])
+                {
+                    found[item.GetString("id")] = item.GetString("sellerId");
+                }
+
+                pending = response.UnprocessedKeys is { Count: > 0 } ? response.UnprocessedKeys : [];
+            }
+        }
+
+        return found;
     }
 
     private static Dictionary<string, AttributeValue> KeyOf(string listingId) =>

@@ -73,6 +73,50 @@ public static class Slug
     }
 
     /// <summary>
+    /// Splits text into lowercase ASCII words, folding accents with the same table as
+    /// <see cref="From"/>. Punctuation, symbols and whitespace are word breaks, so
+    /// <c>"Hot-Wheels #5 (Pokémon)"</c> gives <c>hot, wheels, 5, pokemon</c>.
+    /// </summary>
+    /// <remarks>
+    /// This is what search suggestions match on, so a visitor typing <c>pokemon</c> finds
+    /// "Pokémon". Unlike <see cref="From"/> there is no length cap and no placeholder: text with
+    /// no usable character gives an empty list.
+    /// </remarks>
+    public static IReadOnlyList<string> Words(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return [];
+        }
+
+        var words = new List<string>();
+        var current = new StringBuilder();
+
+        foreach (var raw in text)
+        {
+            var mapped = ToAsciiEquivalent(char.ToLowerInvariant(raw));
+            if (mapped is not null)
+            {
+                current.Append(mapped);
+                continue;
+            }
+
+            if (current.Length > 0)
+            {
+                words.Add(current.ToString());
+                current.Clear();
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            words.Add(current.ToString());
+        }
+
+        return words;
+    }
+
+    /// <summary>
     /// Pulls the id out of a <c>{slug}-{id}</c> path segment, ignoring the slug.
     /// </summary>
     /// <remarks>

@@ -48,6 +48,22 @@ public interface IMediaStorage
         MediaPurpose purpose, string ownerId, string contentType, long contentLength, CancellationToken ct);
 
     /// <summary>
+    /// Grants three uploads at once — original, large, and small — sharing one storage key
+    /// prefix, for a listing photo.
+    /// </summary>
+    /// <remarks>
+    /// Listing photos are the one media purpose rendered at genuinely different sizes in
+    /// genuinely different places: a ~40px dashboard row, a browse/item-card grid, and a
+    /// full-bleed detail-page hero. Serving the multi-megabyte original everywhere would
+    /// waste bandwidth on the two smaller spots; generating derivatives is done client-side
+    /// (see <c>directUpload.ts</c>'s canvas resize) rather than by a server-side pipeline,
+    /// so this grants all three uploads in one round trip instead of three separate ones
+    /// that would otherwise need their own correlated key.
+    /// </remarks>
+    Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct);
+
+    /// <summary>
     /// Confirms an object exists, is within limits, and really is the image type it claimed.
     /// </summary>
     /// <remarks>
@@ -57,9 +73,49 @@ public interface IMediaStorage
     /// </remarks>
     Task<bool> VerifyUploadedAsync(string storageKey, CancellationToken ct);
 
-    /// <summary>Builds the public CDN URL for a stored object.</summary>
-    string PublicUrl(string storageKey);
+    /// <summary>
+    /// The three-object equivalent of <see cref="VerifyUploadedAsync"/>, for a key minted by
+    /// <see cref="CreatePhotoUploadGrantSetAsync"/> — true only when original, large, and
+    /// small all landed.
+    /// </summary>
+    Task<bool> VerifyPhotoUploadedAsync(string storageKey, CancellationToken ct);
+
+    /// <summary>
+    /// Builds the public CDN URL for a stored object.
+    /// </summary>
+    /// <param name="size">
+    /// Ignored for every purpose but <see cref="MediaPurpose.ListingPhoto"/>, whose key is a
+    /// prefix shared by three actual objects rather than one — see
+    /// <see cref="CreatePhotoUploadGrantSetAsync"/>. Defaults to <see cref="PhotoSize.Original"/>.
+    /// </param>
+    string PublicUrl(string storageKey, PhotoSize size = PhotoSize.Original);
 }
+
+/// <summary>
+/// Which of a listing photo's three uploaded sizes a URL should point at — see
+/// <see cref="IMediaStorage.CreatePhotoUploadGrantSetAsync"/> for where the three come from.
+/// </summary>
+public enum PhotoSize
+{
+    /// <summary>The untouched upload — the item detail page's hero image.</summary>
+    Original = 0,
+
+    /// <summary>Resized client-side, ~1200px longest edge — browse grid and item cards.</summary>
+    Large = 1,
+
+    /// <summary>Resized client-side, ~320px longest edge — the dashboard's row thumbnail.</summary>
+    Small = 2,
+}
+
+/// <summary>What one of the three uploads in a <see cref="PhotoUploadGrantSet"/> will be.</summary>
+public sealed record PhotoUploadSpec(string ContentType, long ContentLength);
+
+/// <summary>
+/// Three upload grants sharing one <see cref="StorageKey"/> prefix — see
+/// <see cref="IMediaStorage.CreatePhotoUploadGrantSetAsync"/>.
+/// </summary>
+public sealed record PhotoUploadGrantSet(
+    string StorageKey, UploadGrant Original, UploadGrant Large, UploadGrant Small);
 
 /// <summary>What an uploaded object is for. Decides its key prefix and retention.</summary>
 public enum MediaPurpose
@@ -108,8 +164,12 @@ public sealed record UploadGrant(
 public interface IPhoneVerificationService
 {
     /// <summary>
-    /// Sends a fresh code to <paramref name="phone"/>, replacing any still outstanding.
+    /// Sends a fresh code to <paramref name="phone"/>, replacing any still outstanding for this account.
     /// </summary>
+    /// <param name="ownerId">
+    /// The account asking. The pending challenge belongs to it: nobody else's guesses can touch or
+    /// invalidate it.
+    /// </param>
     /// <returns>
     /// The code itself — present only when the local development stub issues this,
     /// because local development has no SMS gateway to deliver it to. The production SNS
@@ -117,10 +177,16 @@ public interface IPhoneVerificationService
     /// again. Same shape and same reasoning as <c>OtpChallenge.DevCode</c> on the email-OTP
     /// sign-in path.
     /// </returns>
-    Task<string?> RequestCodeAsync(string phone, CancellationToken ct);
+    Task<string?> RequestCodeAsync(string ownerId, string phone, CancellationToken ct);
 
-    /// <summary>Checks the submitted code against the most recent one sent to this number.</summary>
-    Task<bool> VerifyCodeAsync(string phone, string code, CancellationToken ct);
+    /// <summary>
+    /// Checks the submitted code against the one this account last asked to have sent to this number.
+    /// </summary>
+    /// <remarks>
+    /// A right code is spent. A wrong code does <b>not</b> delete the pending one: it counts as an
+    /// attempt, and only after <see cref="VerificationLimits.MaxAttempts"/> of them is it invalidated.
+    /// </remarks>
+    Task<bool> VerifyCodeAsync(string ownerId, string phone, string code, CancellationToken ct);
 }
 
 /// <summary>
@@ -145,10 +211,14 @@ public interface IEmailVerificationService
     /// same reason <see cref="IPhoneVerificationService.RequestCodeAsync"/>'s does. The
     /// production SES adapter never returns one.
     /// </returns>
-    Task<string?> RequestCodeAsync(string email, CancellationToken ct);
+    Task<string?> RequestCodeAsync(string ownerId, string email, CancellationToken ct);
 
-    /// <summary>Checks the submitted code against the most recent one sent to this address.</summary>
-    Task<bool> VerifyCodeAsync(string email, string code, CancellationToken ct);
+    /// <summary>
+    /// Checks the submitted code against the one this account last asked to have sent to this
+    /// address. Wrong guesses count as attempts and do not delete the pending code, exactly as
+    /// <see cref="IPhoneVerificationService.VerifyCodeAsync"/>.
+    /// </summary>
+    Task<bool> VerifyCodeAsync(string ownerId, string email, string code, CancellationToken ct);
 }
 
 /// <summary>
@@ -239,7 +309,9 @@ public interface IIdempotencyStore
     /// </summary>
     /// <remarks>
     /// A conditional write, not a read-then-write: two concurrent requests carrying the
-    /// same key must not both observe "unclaimed" and both proceed.
+    /// same key must not both observe "unclaimed" and both proceed. A claim that never got a
+    /// result and is older than <see cref="IdempotencyExtensions.InFlightLease"/> counts as
+    /// abandoned (its request crashed) and can be claimed again.
     /// </remarks>
     Task<bool> TryClaimAsync(string scope, string key, TimeSpan retention, CancellationToken ct);
 
@@ -248,4 +320,14 @@ public interface IIdempotencyStore
 
     /// <summary>Returns a previously recorded response, if any.</summary>
     Task<string?> GetRecordedResultAsync(string scope, string key, CancellationToken ct);
+
+    /// <summary>
+    /// Gives a claim back so the same key can run again, when the work failed before a result existed.
+    /// </summary>
+    /// <remarks>
+    /// Does nothing once a result has been recorded: a finished request must keep replaying.
+    /// A request that dies without calling this (a crashed or timed-out Lambda) is covered by the
+    /// claim's lease instead, see <see cref="IdempotencyExtensions.InFlightLease"/>.
+    /// </remarks>
+    Task ReleaseClaimAsync(string scope, string key, CancellationToken ct);
 }

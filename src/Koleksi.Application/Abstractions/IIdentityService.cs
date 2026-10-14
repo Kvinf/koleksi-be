@@ -115,6 +115,51 @@ public interface IIdentityService
     /// the pool beyond what the caller's own token grants for themselves.
     /// </remarks>
     Task<string?> GetEmailAsync(string accessToken, CancellationToken ct);
+
+    /// <summary>
+    /// Starts a forgotten-password reset: asks the pool to email a one-time code to the
+    /// address, if it belongs to an account that has a password to reset.
+    /// </summary>
+    /// <returns>
+    /// The code itself when — and only when — the local development stub issued one, for
+    /// the same reason as <see cref="OtpChallenge.DevCode"/>: local development has no
+    /// mailbox. <c>null</c> in every other case, and always <c>null</c> from the Cognito
+    /// adapter. A <c>null</c> says nothing about whether the account exists.
+    /// </returns>
+    /// <remarks>
+    /// Never reports whether the address is registered, whether it is confirmed, or whether
+    /// the account signs in only through Google (and so has no password to reset): all of
+    /// those end in the same silence, because any difference is an enumeration oracle on an
+    /// anonymous endpoint. The caller answers the same way regardless.
+    /// </remarks>
+    Task<string?> RequestPasswordResetAsync(string email, CancellationToken ct);
+
+    /// <summary>Completes a reset with the emailed code and sets the new password.</summary>
+    /// <remarks>
+    /// Failure codes are stable and never distinguish "no such account" from "wrong code":
+    /// see <see cref="PasswordOutcome"/>. Whether a successful reset also ends sessions that
+    /// already exist is a property of the provider, documented on each implementation.
+    /// </remarks>
+    Task<PasswordOutcome> ConfirmPasswordResetAsync(
+        string email, string code, string newPassword, CancellationToken ct);
+
+    /// <summary>
+    /// Changes the signed-in caller's own password, proving knowledge of the current one.
+    /// </summary>
+    /// <remarks>
+    /// Authenticates with the caller's own access token (the same footing as
+    /// <see cref="GetEmailAsync"/>), never with AWS credentials. A successful change also
+    /// ends every other session the account has, so a password changed because it leaked
+    /// does not leave the leaker signed in.
+    /// </remarks>
+    Task<PasswordOutcome> ChangePasswordAsync(
+        string accessToken, string currentPassword, string newPassword, CancellationToken ct);
+
+    /// <summary>
+    /// Whether the caller's account has a Koleksi.id password to change — <c>false</c> for an
+    /// account that only ever signs in through a federated provider (Google).
+    /// </summary>
+    Task<bool> CanChangePasswordAsync(string accessToken, CancellationToken ct);
 }
 
 /// <param name="AccessToken">The bearer token the API validates. Short-lived.</param>
@@ -157,6 +202,25 @@ public sealed record RegistrationOutcome(
     public static RegistrationOutcome AwaitingConfirmationWithCode(string devCode) => new(true, true, null, devCode);
 
     public static RegistrationOutcome Failed(string code) => new(false, false, code);
+
+    /// <summary>
+    /// The address already belongs to an account, so a second one is not created: signing up again with it is "sign
+    /// in to the account you have". <paramref name="existing"/> is how that account signs in (<see cref="EmailAccount"/>).
+    /// </summary>
+    public static RegistrationOutcome EmailRegistered(string existing) => Failed($"{EmailRegisteredCodePrefix}{existing}");
+
+    /// <summary>The failure code is this prefix plus <c>google</c> or <c>password</c>.</summary>
+    public const string EmailRegisteredCodePrefix = "auth.email_registered_";
+}
+
+/// <summary>How an account that already holds an email address signs in. The values are what the failure code carries.</summary>
+public static class EmailAccount
+{
+    /// <summary>A Google account: only Google signs it in.</summary>
+    public const string Google = "google";
+
+    /// <summary>An account with a password and email codes.</summary>
+    public const string Password = "password";
 }
 
 /// <param name="Succeeded">Whether the account is now confirmed and can sign in.</param>
@@ -201,4 +265,20 @@ public sealed record OtpVerifyOutcome(AuthenticatedSession? Session, string? Unc
     public static OtpVerifyOutcome NotConfirmed(string username) => new(null, username);
 
     public static OtpVerifyOutcome Success(AuthenticatedSession session) => new(session, null);
+}
+
+/// <param name="Succeeded">Whether the password is now the new one.</param>
+/// <param name="FailureCode">
+/// A stable code for the frontend to translate, or <c>null</c> on success:
+/// <c>auth.code_invalid</c>, <c>auth.code_expired</c>, <c>auth.password_too_weak</c>,
+/// <c>auth.current_password_invalid</c>, <c>auth.password_unsupported</c>,
+/// <c>auth.invalid_details</c> or <c>auth.try_again_later</c>. A reset never distinguishes
+/// "no such account" from a wrong code — both are <c>auth.code_invalid</c> — for the same
+/// anti-enumeration reason as <see cref="ConfirmOutcome"/>.
+/// </param>
+public sealed record PasswordOutcome(bool Succeeded, string? FailureCode)
+{
+    public static PasswordOutcome Success { get; } = new(true, null);
+
+    public static PasswordOutcome Failed(string code) => new(false, code);
 }

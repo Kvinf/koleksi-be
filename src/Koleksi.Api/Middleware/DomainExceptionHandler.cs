@@ -26,6 +26,8 @@ public sealed partial class DomainExceptionHandler(
     ILogger<DomainExceptionHandler> logger,
     IProblemDetailsService problemDetailsService) : IExceptionHandler
 {
+    private const string RetryAfterSeconds = "2";
+
     public async ValueTask<bool> TryHandleAsync(
         HttpContext httpContext, Exception exception, CancellationToken cancellationToken)
     {
@@ -48,6 +50,12 @@ public sealed partial class DomainExceptionHandler(
         }
 
         httpContext.Response.StatusCode = status;
+
+        if (exception is RequestInProgressException)
+        {
+            // Seconds. The first request is normally done well inside this.
+            httpContext.Response.Headers.RetryAfter = RetryAfterSeconds;
+        }
 
         var problem = new ProblemDetails
         {
@@ -82,11 +90,27 @@ public sealed partial class DomainExceptionHandler(
             DomainException domain when domain.Code.StartsWith("auth.", StringComparison.Ordinal) =>
                 (StatusCodes.Status401Unauthorized, "Authentication required", domain.Message, domain.Code),
 
+            DomainException domain when domain.Code is "account.banned" =>
+                (StatusCodes.Status403Forbidden, "Account banned", domain.Message, domain.Code),
+
             DomainException domain when domain.Code.EndsWith(".forbidden", StringComparison.Ordinal) =>
                 (StatusCodes.Status403Forbidden, "Forbidden", domain.Message, domain.Code),
 
+            // The caller asked too often. 429 rather than 409: nothing is wrong with the state of
+            // anything, they simply have to wait.
+            DomainException domain when domain.Code is "profile.otp_cooldown" or "profile.otp_limit" =>
+                (StatusCodes.Status429TooManyRequests, "Too many requests", domain.Message, domain.Code),
+
             DomainException domain =>
                 (StatusCodes.Status409Conflict, "Request conflicts with current state", domain.Message, domain.Code),
+
+            // The same Idempotency-Key is still being processed by an earlier request. 409, not
+            // 503: nothing is down, running this one would duplicate the first, and the retry
+            // (after Retry-After) replays the first request's recorded result.
+            RequestInProgressException =>
+                (StatusCodes.Status409Conflict, "Request in progress",
+                    "A request with the same Idempotency-Key is still being processed. Retry in a moment.",
+                    "request.in_progress"),
 
             // Retries were exhausted under contention. 503 with a retry hint is honest:
             // the request was well-formed and may well succeed shortly.

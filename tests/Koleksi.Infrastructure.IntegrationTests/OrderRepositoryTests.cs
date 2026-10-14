@@ -1,6 +1,7 @@
 using Koleksi.Application.Abstractions;
 using Koleksi.Domain.Common;
 using Koleksi.Domain.Orders;
+using Koleksi.Infrastructure.Persistence;
 using Shouldly;
 
 namespace Koleksi.Infrastructure.IntegrationTests;
@@ -129,5 +130,130 @@ public sealed class OrderRepositoryTests : DynamoTestBase
             Fixtures.Clock.UtcNow + Order.AutoReleaseAfterDelivery + TimeSpan.FromMinutes(1), 10, Ct);
 
         due.ShouldContain(candidate => candidate.Id == order.Id);
+    }
+
+    [DynamoLocalFact]
+    public async Task An_unpaid_order_is_due_for_cancellation_only_once_its_window_has_elapsed()
+    {
+        var order = Fixtures.SampleOrder(Fixtures.ActiveListing());
+        await Table.Orders.AddManyAsync([order], Ct);
+
+        var windowEnds = order.CreatedAt + Order.PaymentWindow;
+
+        (await Table.Orders.ListPaymentExpiredAsync(windowEnds - TimeSpan.FromSeconds(1), 10, Ct))
+            .ShouldNotContain(candidate => candidate.Id == order.Id);
+
+        // Inclusive of the instant itself (the tick boundary), like the auction sweep.
+        (await Table.Orders.ListPaymentExpiredAsync(windowEnds, 10, Ct))
+            .ShouldContain(candidate => candidate.Id == order.Id);
+    }
+
+    [DynamoLocalFact]
+    public async Task A_paid_order_drops_out_of_the_cancellation_sweep()
+    {
+        // The whole-item write that records payment carries no sweep key, which is what removes it.
+        var order = Fixtures.SampleOrder(Fixtures.ActiveListing());
+        await Table.Orders.AddManyAsync([order], Ct);
+
+        order.ConfirmPayment(order.GrandTotal, Fixtures.Clock);
+        await Table.Orders.UpdateAsync(order, expectedVersion: 0, Ct);
+
+        var farFuture = order.CreatedAt + TimeSpan.FromDays(30);
+        (await Table.Orders.ListPaymentExpiredAsync(farFuture, 10, Ct)).ShouldBeEmpty();
+        (await Table.Orders.ListDueForAutoReleaseAsync(farFuture, 10, Ct)).ShouldBeEmpty();
+    }
+
+    [DynamoLocalFact]
+    public async Task A_cancelled_order_drops_out_of_the_cancellation_sweep()
+    {
+        var order = Fixtures.SampleOrder(Fixtures.ActiveListing());
+        await Table.Orders.AddManyAsync([order], Ct);
+
+        order.Cancel(Fixtures.Clock);
+        await Table.Orders.UpdateAsync(order, expectedVersion: 0, Ct);
+
+        (await Table.Orders.ListPaymentExpiredAsync(order.CreatedAt + TimeSpan.FromDays(30), 10, Ct)).ShouldBeEmpty();
+    }
+
+    [DynamoLocalFact]
+    public async Task The_two_order_sweeps_do_not_see_each_others_orders()
+    {
+        var unpaid = Fixtures.SampleOrder(Fixtures.ActiveListing("Kartu Belum Dibayar Nomor Satu Dua Tiga"));
+        var delivered = Fixtures.SampleOrder(Fixtures.ActiveListing("Kartu Sudah Terkirim Nomor Empat Lima"));
+        await Table.Orders.AddManyAsync([unpaid, delivered], Ct);
+
+        delivered.ConfirmPayment(delivered.GrandTotal, Fixtures.Clock);
+        delivered.MarkShipped(
+            Shipment.Create("jne", "JNE1234567890", "photo/parcel.jpg", "photo/label.jpg",
+                DateOnly.FromDateTime(Fixtures.Clock.UtcNow.UtcDateTime)),
+            delivered.SellerId, Fixtures.Clock);
+        delivered.MarkDelivered(Fixtures.Clock);
+        await Table.Orders.UpdateAsync(delivered, expectedVersion: 0, Ct);
+
+        var farFuture = Fixtures.Clock.UtcNow + TimeSpan.FromDays(30);
+
+        (await Table.Orders.ListPaymentExpiredAsync(farFuture, 10, Ct)).ShouldHaveSingleItem().Id.ShouldBe(unpaid.Id);
+        (await Table.Orders.ListDueForAutoReleaseAsync(farFuture, 10, Ct)).ShouldHaveSingleItem().Id.ShouldBe(delivered.Id);
+    }
+
+    [DynamoLocalFact]
+    public async Task A_released_order_drops_out_of_the_release_sweep()
+    {
+        var order = Fixtures.SampleOrder(Fixtures.ActiveListing());
+        await Table.Orders.AddManyAsync([order], Ct);
+
+        order.ConfirmPayment(order.GrandTotal, Fixtures.Clock);
+        order.MarkShipped(
+            Shipment.Create("jne", "JNE1234567890", "photo/parcel.jpg", "photo/label.jpg",
+                DateOnly.FromDateTime(Fixtures.Clock.UtcNow.UtcDateTime)),
+            order.SellerId, Fixtures.Clock);
+        order.MarkDelivered(Fixtures.Clock);
+        await Table.Orders.UpdateAsync(order, expectedVersion: 0, Ct);
+
+        var version = order.Version;
+        order.Release(confirmedByBuyer: true, Fixtures.Clock);
+        await Table.Orders.UpdateAsync(order, version, Ct);
+
+        (await Table.Orders.ListDueForAutoReleaseAsync(Fixtures.Clock.UtcNow + TimeSpan.FromDays(30), 10, Ct))
+            .ShouldBeEmpty();
+    }
+
+    [DynamoLocalFact]
+    public async Task Orders_and_auctions_share_the_index_without_ever_meeting()
+    {
+        // Both ride gsi_auction_end. An order query that returned an auction row (or the reverse)
+        // would fail to map, so succeeding with exactly the right rows is the assertion.
+        var auction = Fixtures.LiveAuction(Fixtures.ActiveListing("Kartu Lelang Di Indeks Yang Sama"), duration: TimeSpan.FromHours(2));
+        await Table.Auctions.AddAsync(auction, Ct);
+
+        var order = Fixtures.SampleOrder(Fixtures.ActiveListing("Kartu Pesanan Di Indeks Yang Sama"));
+        await Table.Orders.AddManyAsync([order], Ct);
+
+        var farFuture = Fixtures.Clock.UtcNow + TimeSpan.FromDays(30);
+
+        (await Table.Orders.ListPaymentExpiredAsync(farFuture, 10, Ct)).ShouldHaveSingleItem().Id.ShouldBe(order.Id);
+        (await Table.Auctions.ListDueForCloseAsync(farFuture, 10, Ct)).ShouldHaveSingleItem().ListingId.ShouldBe(auction.ListingId);
+    }
+
+    [DynamoLocalFact]
+    public async Task The_cancellation_sweep_reads_every_shard_and_honours_its_limit()
+    {
+        var seeded = new List<Order>();
+        var shards = new HashSet<int>();
+        for (var i = 0; i < 200 && shards.Count < DynamoTable.AuctionShardCount; i++)
+        {
+            var order = Fixtures.SampleOrder(Fixtures.ActiveListing($"Kartu Pesanan Lintas Shard Nomor {i:D3}"));
+            seeded.Add(order);
+            shards.Add(DynamoTable.ShardOf(order.Id));
+        }
+
+        shards.Count.ShouldBe(DynamoTable.AuctionShardCount);
+        await Table.Orders.AddManyAsync(seeded.Take(25).ToList(), Ct);
+        await Table.Orders.AddManyAsync(seeded.Skip(25).ToList(), Ct);
+
+        var farFuture = Fixtures.Clock.UtcNow + TimeSpan.FromDays(30);
+
+        (await Table.Orders.ListPaymentExpiredAsync(farFuture, 500, Ct)).Count.ShouldBe(seeded.Count);
+        (await Table.Orders.ListPaymentExpiredAsync(farFuture, 4, Ct)).Count.ShouldBeLessThanOrEqualTo(4);
     }
 }

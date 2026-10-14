@@ -40,6 +40,26 @@ public sealed class Listing
     /// </remarks>
     public static readonly Money MinimumPrice = Money.FromRupiah(10_000);
 
+    /// <summary>
+    /// The ceiling for any listed price: Rp 1.000.000.000 per item (QA D-07).
+    /// </summary>
+    /// <remarks>
+    /// Keeps every total (an order of up to 20 items plus shipping) far inside a <see cref="long"/>,
+    /// and the price sort key (16 digits, see <c>DynamoTable</c>) well inside its width, so a huge
+    /// price can neither overflow arithmetic nor sort out of order. Above this is not a C2C
+    /// collectible sale this escrow is built for.
+    /// </remarks>
+    public static readonly Money MaximumPrice = Money.FromRupiah(1_000_000_000);
+
+    /// <summary>The most units one listing can offer.</summary>
+    public const int MaxStock = 99;
+
+    /// <summary>Longest condition label accepted; it rides on every browse card.</summary>
+    public const int MaxConditionLength = 60;
+
+    /// <summary>Longest city accepted; it rides on every browse card.</summary>
+    public const int MaxCityLength = 80;
+
     private readonly List<ListingPhoto> _photos = [];
     private readonly Dictionary<string, string> _attributes = new(StringComparer.Ordinal);
 
@@ -76,6 +96,15 @@ public sealed class Listing
     public string Title { get; private set; }
     public string Description { get; private set; } = string.Empty;
     public Money Price { get; private set; }
+
+    /// <summary>
+    /// How many units the seller is offering at this price: 1 for a one-of-one collectible, more for
+    /// something they have several of. An auction is always exactly one. How many are still free is not
+    /// stored here: it is what the reservation store says, because units are taken by orders that may
+    /// still lapse (see <c>IListingHoldStore</c>).
+    /// </summary>
+    public int Stock { get; private set; } = 1;
+
     public ListingFormat Format { get; private set; }
     public ListingStatus Status { get; private set; }
 
@@ -131,6 +160,20 @@ public sealed class Listing
     /// </summary>
     public decimal? AutoDeclineBelowPercent { get; private set; }
 
+    /// <summary>
+    /// How long the auction runs once published, in days. Kept on the listing so a draft
+    /// remembers it: the <see cref="Koleksi.Domain.Auctions.Auction"/> itself does not exist
+    /// until the listing is published. <c>null</c> for every other format, and for drafts
+    /// saved before this was stored.
+    /// </summary>
+    public int? AuctionDurationDays { get; private set; }
+
+    /// <summary>The reserve the auction will be created with. <c>null</c> means any bid wins.</summary>
+    public Money? AuctionReservePrice { get; private set; }
+
+    /// <summary>The buy-now price the auction will be created with. <c>null</c> means none.</summary>
+    public Money? AuctionBuyoutPrice { get; private set; }
+
     /// <summary>The public URL path for this listing, e.g. <c>/kartu/psa-10-charizard-01J8Z...</c>.</summary>
     public string UrlPath(string categorySlug) => $"/{categorySlug}/{Slug.From(Title)}-{Id}";
 
@@ -138,6 +181,12 @@ public sealed class Listing
     public bool IsPubliclyVisible => Status is ListingStatus.Active or ListingStatus.Sold;
 
     /// <summary>Creates a draft listing. Nothing is visible to buyers until <see cref="Publish"/>.</summary>
+    /// <remarks>
+    /// A draft is a work in progress, so only what identifies it is required: a category and a
+    /// non-blank title. The price, condition, city, photos and description may all still be
+    /// empty, and the title may still be shorter than a published one must be. Every one of
+    /// those is enforced when the listing goes live, in <see cref="Publish"/>.
+    /// </remarks>
     public static Listing CreateDraft(
         string sellerId,
         string categoryId,
@@ -150,8 +199,6 @@ public sealed class Listing
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(categoryId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(condition);
-        ArgumentException.ThrowIfNullOrWhiteSpace(city);
         ArgumentNullException.ThrowIfNull(clock);
 
         var now = clock.UtcNow;
@@ -159,11 +206,11 @@ public sealed class Listing
             EntityId.New(now),
             sellerId,
             categoryId,
-            ValidateTitle(title),
-            ValidatePrice(price),
+            ValidateDraftTitle(title),
+            EnsureWithinCeiling(price),
             format,
-            condition.Trim(),
-            city.Trim(),
+            BoundedLabel(condition, MaxConditionLength, "listing.condition_too_long", "Condition"),
+            BoundedLabel(city, MaxCityLength, "listing.city_too_long", "City"),
             now);
     }
 
@@ -194,15 +241,24 @@ public sealed class Listing
         DateTimeOffset createdAt,
         DateTimeOffset updatedAt,
         DateTimeOffset? publishedAt,
-        long version)
+        long version,
+        int? auctionDurationDays = null,
+        Money? auctionReservePrice = null,
+        Money? auctionBuyoutPrice = null,
+        int stock = 1)
     {
         var listing = new Listing(id, sellerId, categoryId, title, price, format, condition, city, createdAt)
         {
+            // Rows written before stock existed are one-of-one.
+            Stock = format == ListingFormat.Auction ? 1 : Math.Clamp(stock, 1, MaxStock),
             Description = description,
             Status = status,
             ViewCount = viewCount,
             WatcherCount = watcherCount,
             AutoDeclineBelowPercent = autoDeclineBelowPercent,
+            AuctionDurationDays = auctionDurationDays,
+            AuctionReservePrice = auctionReservePrice,
+            AuctionBuyoutPrice = auctionBuyoutPrice,
             UpdatedAt = updatedAt,
             PublishedAt = publishedAt,
             Version = version,
@@ -274,6 +330,28 @@ public sealed class Listing
         Touch(clock);
     }
 
+    /// <summary>
+    /// Remembers the auction terms the seller chose, so saving a draft does not lose them.
+    /// Cleared (all <c>null</c>) for any other format.
+    /// </summary>
+    /// <remarks>
+    /// Stored as given: whether the terms are <em>valid</em> (a duration in range, a reserve
+    /// between the start and the buyout) is the auction's own rule and is enforced when the
+    /// auction is created at publish, so a half-finished draft can still be saved.
+    /// </remarks>
+    public void SetAuctionTerms(int? durationDays, Money? reservePrice, Money? buyoutPrice, IClock clock)
+    {
+        if (durationDays is <= 0)
+        {
+            throw DomainException.For("auction.invalid_duration", "Auction duration must be at least one day.");
+        }
+
+        AuctionDurationDays = durationDays;
+        AuctionReservePrice = reservePrice is { } reserve ? EnsureWithinCeiling(reserve) : null;
+        AuctionBuyoutPrice = buyoutPrice is { } buyout ? EnsureWithinCeiling(buyout) : null;
+        Touch(clock);
+    }
+
     /// <summary>Makes the listing visible to buyers.</summary>
     /// <exception cref="DomainException">The listing is incomplete or not in a publishable state.</exception>
     public void Publish(IClock clock)
@@ -283,13 +361,44 @@ public sealed class Listing
             throw DomainException.For("listing.not_publishable", $"A {Status} listing cannot be published.");
         }
 
-        if (_photos.Count < MinPhotosToPublish)
-        {
-            throw DomainException.For("listing.photo_required", "Add at least one photo before publishing.");
-        }
+        EnsureComplete();
 
         Status = ListingStatus.Active;
         PublishedAt ??= clock.UtcNow;
+        Touch(clock);
+    }
+
+    /// <summary>
+    /// Sets how many units are on offer. An auction is always one. Refused once the listing is sold or
+    /// suspended. The caller is responsible for checking the new number against units already sold or
+    /// reserved (only the reservation store knows them).
+    /// </summary>
+    /// <exception cref="DomainException">The number is outside 1 to <see cref="MaxStock"/>, or the listing cannot change.</exception>
+    public void SetStock(int stock, IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (Status is ListingStatus.Sold or ListingStatus.Suspended)
+        {
+            throw DomainException.For("listing.not_editable", $"A {Status} listing cannot be edited.");
+        }
+
+        if (stock is < 1 or > MaxStock)
+        {
+            throw DomainException.For("listing.invalid_stock", $"Stock must be between 1 and {MaxStock}.");
+        }
+
+        if (Format == ListingFormat.Auction && stock != 1)
+        {
+            throw DomainException.For("listing.auction_stock_fixed", "An auction is always a single item.");
+        }
+
+        if (stock == Stock)
+        {
+            return;
+        }
+
+        Stock = stock;
         Touch(clock);
     }
 
@@ -314,13 +423,22 @@ public sealed class Listing
     /// Marks the listing sold once an order has been paid for.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Called only from the order flow, after payment is confirmed by the gateway
     /// webhook — never from a client request. This is what stops a second buyer from
     /// purchasing an item that is already gone.
+    /// </para>
+    /// <para>
+    /// An <see cref="ListingStatus.Archived"/> listing can still be sold: payment is authoritative.
+    /// The money has been taken for this item, so a seller who delisted it while the buyer was on
+    /// the payment page must not be left holding a Paid order for a listing they can republish and
+    /// sell a second time. Archiving is refused while a sale is in flight (see the archive
+    /// endpoint), so this only covers a payment that lands after its hold lapsed.
+    /// </para>
     /// </remarks>
     public void MarkSold(IClock clock)
     {
-        if (Status != ListingStatus.Active)
+        if (Status is not (ListingStatus.Active or ListingStatus.Archived))
         {
             throw DomainException.For("listing.not_purchasable", $"A {Status} listing cannot be sold.");
         }
@@ -333,6 +451,152 @@ public sealed class Listing
     public void Suspend(IClock clock)
     {
         Status = ListingStatus.Suspended;
+        Touch(clock);
+    }
+
+    /// <summary>
+    /// Replaces every seller-editable field on a listing that has never been live — same shape as
+    /// <see cref="CreateDraft"/>, since editing a draft is filling in the same form again.
+    /// </summary>
+    /// <remarks>
+    /// Restricted to <see cref="IsUnpublished"/> deliberately: once a listing has been live,
+    /// changing its category, format or title would misdescribe something a buyer may already be
+    /// watching or bidding on. A listing that is or was live is edited with <see cref="EditLive"/>
+    /// instead, which leaves those fields alone. Draft rules apply here, not publish rules (see
+    /// <see cref="CreateDraft"/>); <see cref="Publish"/> checks the rest.
+    /// </remarks>
+    /// <exception cref="DomainException">The listing is, or has been, live.</exception>
+    public void EditDraft(
+        string categoryId,
+        string title,
+        Money price,
+        ListingFormat format,
+        string condition,
+        string city,
+        IClock clock)
+    {
+        if (!IsUnpublished)
+        {
+            throw DomainException.For("listing.not_editable", $"A {Status} listing cannot be edited this way.");
+        }
+
+        ArgumentException.ThrowIfNullOrWhiteSpace(categoryId);
+
+        CategoryId = categoryId;
+        Title = ValidateDraftTitle(title);
+        Price = EnsureWithinCeiling(price);
+        Format = format;
+        if (format == ListingFormat.Auction)
+        {
+            Stock = 1;
+        }
+
+        Condition = BoundedLabel(condition, MaxConditionLength, "listing.condition_too_long", "Condition");
+        City = BoundedLabel(city, MaxCityLength, "listing.city_too_long", "City");
+        Touch(clock);
+    }
+
+    /// <summary>
+    /// Edits a listing that is, or has been, live: the fields a seller may safely correct after
+    /// buyers can see it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Editable: description, photos, condition, city, and the price of a fixed-price or nego
+    /// listing. Never editable here: seller, category, format, title, and (for an auction) the
+    /// starting price and terms. The title stays fixed because it is what a watcher, offerer or
+    /// bidder agreed to; a typo is fixed by delisting and relisting, not silently under their feet.
+    /// </para>
+    /// <para>
+    /// An auction is editable only while it has no bids, the same line <c>Auction.Cancel</c> draws
+    /// (<c>auction.has_bids</c>): a bidder has committed money to what the page said at the time.
+    /// The domain cannot see bids (they live on the separate Auction aggregate), so the caller
+    /// passes whether any exist.
+    /// </para>
+    /// <para>
+    /// Everything is validated before anything is assigned, and the version moves once, so a
+    /// refused edit leaves the listing exactly as it was and an accepted one is a single change.
+    /// </para>
+    /// </remarks>
+    /// <param name="auctionHasBids">Whether this listing's auction has taken at least one bid. Ignored for other formats.</param>
+    /// <exception cref="DomainException">The listing is not editable, or a value breaks a listing rule.</exception>
+    public void EditLive(
+        Money price,
+        string description,
+        string condition,
+        string city,
+        IEnumerable<ListingPhoto> photos,
+        bool auctionHasBids,
+        IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(description);
+        ArgumentNullException.ThrowIfNull(photos);
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (IsUnpublished || Status is not (ListingStatus.Active or ListingStatus.Archived))
+        {
+            throw DomainException.For("listing.not_editable", $"A {Status} listing cannot be edited.");
+        }
+
+        if (Format == ListingFormat.Auction)
+        {
+            if (auctionHasBids)
+            {
+                throw DomainException.For(
+                    "auction.has_bids",
+                    "An auction that already has bids cannot be edited.");
+            }
+
+            if (price != Price)
+            {
+                throw DomainException.For(
+                    "listing.auction_price_immutable",
+                    "An auction's starting bid cannot be changed once created.");
+            }
+        }
+        else if (price != Price)
+        {
+            // An unchanged price is never re-checked: a stored price from before the floor existed
+            // must not make an unrelated description edit fail.
+            ValidatePrice(price);
+        }
+
+        var newPhotos = photos.ToList();
+        if (newPhotos.Count < MinPhotosToPublish)
+        {
+            throw DomainException.For("listing.photo_required", "A live listing needs at least one photo.");
+        }
+
+        if (newPhotos.Count > MaxPhotos)
+        {
+            throw DomainException.For("listing.too_many_photos", $"A listing accepts at most {MaxPhotos} photos.");
+        }
+
+        if (description.Length > MaxDescriptionLength)
+        {
+            throw DomainException.For(
+                "listing.description_too_long",
+                $"Description exceeds {MaxDescriptionLength} characters.");
+        }
+
+        var trimmedCondition = BoundedLabel(condition, MaxConditionLength, "listing.condition_too_long", "Condition");
+        if (trimmedCondition.Length == 0)
+        {
+            throw DomainException.For("listing.condition_required", "Choose the item's condition.");
+        }
+
+        var trimmedCity = BoundedLabel(city, MaxCityLength, "listing.city_too_long", "City");
+        if (trimmedCity.Length == 0)
+        {
+            throw DomainException.For("listing.city_required", "Enter the city the item ships from.");
+        }
+
+        Price = price;
+        Description = description.Trim();
+        Condition = trimmedCondition;
+        City = trimmedCity;
+        _photos.Clear();
+        _photos.AddRange(newPhotos);
         Touch(clock);
     }
 
@@ -372,6 +636,53 @@ public sealed class Listing
     /// <summary>Applies a watcher-count delta read back from the atomic counter.</summary>
     public void ApplyWatcherCount(long value) => WatcherCount = value;
 
+    /// <summary>
+    /// True until the listing has gone live for the first time: a draft, or a draft that was
+    /// delisted before ever being published. Such a listing has no buyers to mislead, so it is
+    /// edited as freely as a draft.
+    /// </summary>
+    public bool IsUnpublished =>
+        Status == ListingStatus.Draft || (Status == ListingStatus.Archived && PublishedAt is null);
+
+    /// <summary>
+    /// The rules a listing must meet to be shown to buyers. A draft may break all of them; this
+    /// is the single place they are enforced.
+    /// </summary>
+    private void EnsureComplete()
+    {
+        ValidateTitle(Title);
+        ValidatePrice(Price);
+
+        if (string.IsNullOrWhiteSpace(Condition))
+        {
+            throw DomainException.For("listing.condition_required", "Choose the item's condition before publishing.");
+        }
+
+        if (string.IsNullOrWhiteSpace(City))
+        {
+            throw DomainException.For("listing.city_required", "Enter the city the item ships from before publishing.");
+        }
+
+        if (_photos.Count < MinPhotosToPublish)
+        {
+            throw DomainException.For("listing.photo_required", "Add at least one photo before publishing.");
+        }
+    }
+
+    // A draft needs a title to be told apart from its siblings on the dashboard, but not the
+    // length a public title must have. The length floor is checked at publish (ValidateTitle).
+    private static string ValidateDraftTitle(string title)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+
+        var trimmed = title.Trim();
+        return trimmed.Length > MaxTitleLength
+            ? throw DomainException.For(
+                "listing.title_too_long",
+                $"Title must be at most {MaxTitleLength} characters.")
+            : trimmed;
+    }
+
     private static string ValidateTitle(string title)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
@@ -391,7 +702,20 @@ public sealed class Listing
 
     private static Money ValidatePrice(Money price) => price < MinimumPrice
         ? throw DomainException.For("listing.price_too_low", $"Price must be at least {MinimumPrice}.")
+        : EnsureWithinCeiling(price);
+
+    /// <summary>The ceiling alone, for drafts, which may still be below the floor.</summary>
+    private static Money EnsureWithinCeiling(Money price) => price > MaximumPrice
+        ? throw DomainException.For("listing.price_too_high", $"Price must be at most {MaximumPrice}.")
         : price;
+
+    private static string BoundedLabel(string? value, int maxLength, string code, string name)
+    {
+        var trimmed = (value ?? string.Empty).Trim();
+        return trimmed.Length > maxLength
+            ? throw DomainException.For(code, $"{name} must be at most {maxLength} characters.")
+            : trimmed;
+    }
 
     private void Touch(IClock clock)
     {

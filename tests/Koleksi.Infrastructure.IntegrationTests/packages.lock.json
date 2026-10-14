@@ -72,6 +72,14 @@
           "AWSSDK.CognitoIdentityProvider": "4.0.6.2"
         }
       },
+      "AWSSDK.ApiGatewayManagementApi": {
+        "type": "Transitive",
+        "resolved": "4.0.100.16",
+        "contentHash": "GsvfEdSUyKR/s6SGXpZphwOjVbREOHOGwiwCl95BNP3zdZFkuXKt2r2w1T0WheH0smMViZdeD1SjHiwSscRD7w==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.102.8, 5.0.0)"
+        }
+      },
       "AWSSDK.CognitoIdentity": {
         "type": "Transitive",
         "resolved": "4.0.2.18",
@@ -91,8 +99,8 @@
       },
       "AWSSDK.Core": {
         "type": "Transitive",
-        "resolved": "4.0.101.1",
-        "contentHash": "NtMRfAGDrdb5PVnTL4vIrnPuPSXbBw0j9+voVMYmgsH5Ep5H4tuNMkPJZCOO9q99mh0L9ClOwVkQHCliR5uOLA=="
+        "resolved": "4.0.102.8",
+        "contentHash": "90B9Skhl+ORbtWNXrrmGdGhGvAfZiPmZafRYrB/xHelZjePIwPvXioqz9UiiF1vo21eDLzTnXh5EC4RjbNWsFQ=="
       },
       "AWSSDK.Extensions.NETCore.Setup": {
         "type": "Transitive",
@@ -363,6 +371,7 @@
       "koleksi.infrastructure": {
         "type": "Project",
         "dependencies": {
+          "AWSSDK.ApiGatewayManagementApi": "[4.0.100.16, )",
           "AWSSDK.CognitoIdentityProvider": "[4.0.103.2, )",
           "AWSSDK.DynamoDBv2": "[4.0.103.1, )",
           "AWSSDK.Extensions.NETCore.Setup": "[4.0.100.8, )",

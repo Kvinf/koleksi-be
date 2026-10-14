@@ -34,6 +34,9 @@ public sealed class UserProfile
 {
     public const int MaxAddresses = 10;
 
+    /// <summary>Longest full name accepted. The name rides on profile reads, so it is bounded.</summary>
+    public const int MaxFullNameLength = 100;
+
     private readonly List<Address> _addresses = [];
 
     private UserProfile(string id, DateTimeOffset createdAt)
@@ -57,6 +60,13 @@ public sealed class UserProfile
     public string? AvatarKey { get; private set; }
 
     public IdVerificationStatus IdVerificationStatus { get; private set; }
+
+    /// <summary>
+    /// Storage key of the submitted identity document, in the private bucket. Kept so the upload
+    /// is referenced by something a reviewer can find. Never part of any response: an identity
+    /// document has no public URL by construction, and neither does its key.
+    /// </summary>
+    public string? IdDocumentKey { get; private set; }
 
     public BankAccount? BankAccount { get; private set; }
 
@@ -90,7 +100,8 @@ public sealed class UserProfile
         IEnumerable<Address> addresses,
         DateTimeOffset createdAt,
         DateTimeOffset updatedAt,
-        long version)
+        long version,
+        string? idDocumentKey = null)
     {
         var profile = new UserProfile(id, createdAt)
         {
@@ -99,6 +110,7 @@ public sealed class UserProfile
             PhoneVerified = phoneVerified,
             AvatarKey = avatarKey,
             IdVerificationStatus = idVerificationStatus,
+            IdDocumentKey = idDocumentKey,
             BankAccount = bankAccount,
             UpdatedAt = updatedAt,
             Version = version,
@@ -123,20 +135,40 @@ public sealed class UserProfile
         ArgumentNullException.ThrowIfNull(addresses);
         ArgumentNullException.ThrowIfNull(clock);
 
+        if (fullName.Trim().Length > MaxFullNameLength)
+        {
+            throw DomainException.For(
+                "profile.name_too_long", $"The name must be at most {MaxFullNameLength} characters.");
+        }
+
         if (addresses.Count > MaxAddresses)
         {
             throw DomainException.For(
                 "profile.too_many_addresses", $"A profile may hold at most {MaxAddresses} addresses.");
         }
 
-        if (addresses.Count(a => a.IsDefault) > 1)
+        // Two rows flagged default is something the screen's own editing can produce (tick a
+        // second one before unticking the first), not a malformed request, so it is repaired
+        // rather than refused: the last one marked wins and the rest are cleared. Refusing it
+        // cost people their whole save, address edits included.
+        var lastDefault = -1;
+        for (var i = 0; i < addresses.Count; i++)
         {
-            throw DomainException.For("profile.multiple_default_addresses", "Only one address may be default.");
+            if (addresses[i].IsDefault)
+            {
+                lastDefault = i;
+            }
         }
 
         FullName = fullName.Trim();
         _addresses.Clear();
-        _addresses.AddRange(addresses);
+        for (var i = 0; i < addresses.Count; i++)
+        {
+            _addresses.Add(addresses[i].IsDefault && i != lastDefault
+                ? addresses[i] with { IsDefault = false }
+                : addresses[i]);
+        }
+
         Touch(clock);
     }
 
@@ -198,8 +230,13 @@ public sealed class UserProfile
     /// reach, since that is also the account holder an attacker took over would use to hide
     /// the takeover from a reviewer.
     /// </remarks>
-    public void SubmitIdVerification(IClock clock)
+    /// <param name="idDocumentKey">
+    /// The private-bucket key of the uploaded document. A resubmission replaces it: the latest
+    /// upload is the one a reviewer should look at.
+    /// </param>
+    public void SubmitIdVerification(string idDocumentKey, IClock clock)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(idDocumentKey);
         ArgumentNullException.ThrowIfNull(clock);
 
         if (IdVerificationStatus == IdVerificationStatus.Verified)
@@ -208,6 +245,7 @@ public sealed class UserProfile
                 "profile.already_verified", "Identity is already verified and cannot be resubmitted.");
         }
 
+        IdDocumentKey = idDocumentKey;
         IdVerificationStatus = IdVerificationStatus.Pending;
         Touch(clock);
     }

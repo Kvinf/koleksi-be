@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Auctions;
 using Koleksi.Domain.Common;
 using Microsoft.Extensions.Logging;
@@ -23,10 +24,12 @@ namespace Koleksi.Application.Features.Auctions;
 /// </remarks>
 public sealed partial class PlaceBidHandler(
     IAuctionRepository auctions,
+    IListingRepository listings,
     IListingSearchIndex searchIndex,
     IAuctionEventPublisher events,
     ICurrentUser currentUser,
     IClock clock,
+    PublicIdentityResolver identities,
     ILogger<PlaceBidHandler> logger)
 {
     // Source-generated log methods. Bidding is the hottest write path in the product,
@@ -67,11 +70,16 @@ public sealed partial class PlaceBidHandler(
         ArgumentNullException.ThrowIfNull(command);
 
         var bidderId = currentUser.RequireUserId();
-        var bidderUsername = currentUser.Username
-            ?? throw DomainException.For("auction.no_username", "Your profile is missing a username.");
+        var bidderUsername = (await identities.ResolveAsync(bidderId, ct).ConfigureAwait(false)).Handle;
 
         var amount = Money.TryFromRupiah(command.AmountRupiah)
             ?? throw DomainException.For("auction.invalid_amount", "Bid amount must be a positive number.");
+
+        // The auction does not know whether its listing is still for sale (D-09).
+        if (!await AuctionListingGuard.EnsureForSaleAsync(listings, command.ListingId, ct).ConfigureAwait(false))
+        {
+            return PlaceBidResult.NotFound;
+        }
 
         for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
@@ -151,6 +159,13 @@ public sealed partial class PlaceBidHandler(
                 // Expected under contention. Logged at debug so a hot auction does not
                 // fill the log with noise that looks like a fault.
                 LogBidRetry(logger, command.ListingId, attempt);
+
+                // Jittered, so two bids that collided in the same instant do not read the
+                // same state and collide again in lock step. The delay also gives the
+                // winner's transaction time to finish: DynamoDB turns away a conflicting
+                // transaction outright (TransactionConflict) rather than queueing it, and
+                // an immediate re-read could still see the pre-bid auction.
+                await Task.Delay(System.Security.Cryptography.RandomNumberGenerator.GetInt32(15, 50) * attempt, ct).ConfigureAwait(false);
             }
         }
 

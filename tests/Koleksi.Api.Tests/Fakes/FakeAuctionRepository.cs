@@ -96,6 +96,23 @@ public sealed class FakeAuctionRepository : FakeAdapter, IAuctionRepository
         return Task.FromResult(history);
     }
 
+    public Task<IReadOnlyList<Auction>> ListDueForWinnerPaymentAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        IReadOnlyList<Auction> due = _auctions.Values
+            .Where(auction => auction.Status == AuctionStatus.Ended
+                && auction.WinnerPaymentResolvedAt is null
+                && auction.PaymentDueAt is { } dueAt && dueAt <= asOf)
+            .OrderBy(auction => auction.PaymentDueAt)
+            .Take(limit)
+            .Select(Copy)
+            .ToList();
+
+        return Task.FromResult(due);
+    }
+
     public Task<IReadOnlyList<Auction>> ListDueForCloseAsync(
         DateTimeOffset asOf, int limit, CancellationToken ct)
     {
@@ -124,5 +141,7 @@ public sealed class FakeAuctionRepository : FakeAdapter, IAuctionRepository
         auction.LeadingBidderUsername,
         auction.Version,
         auction.ReservePrice,
-        auction.BuyoutPrice);
+        auction.BuyoutPrice,
+        auction.ClosedAt,
+        auction.WinnerPaymentResolvedAt);
 }

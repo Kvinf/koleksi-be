@@ -154,6 +154,35 @@ public sealed class AuthEndpointTests(KoleksiApiFactory factory) : IClassFixture
         }
     }
 
+    [Theory]
+    [InlineData(EmailAccount.Google)]
+    [InlineData(EmailAccount.Password)]
+    public async Task An_address_that_already_has_an_account_is_reported_with_how_that_account_signs_in(string existing)
+    {
+        // Sign-up does not create a second account for an address that has one: it says so, and the website offers the
+        // way in that account has (a code to that address, or Google), which is also how the two end up as one.
+        factory.Identity.NextRegistration = RegistrationOutcome.EmailRegistered(existing);
+
+        try
+        {
+            using var client = factory.CreateClientFrom("203.0.113.8");
+
+            using var response = await client.PostAsJsonAsync("/api/auth/register", new
+            {
+                username = "budi.baru",
+                email = "already-registered@example.test",
+                password = "correct-horse-battery-staple",
+            });
+
+            response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+            (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe($"auth.email_registered_{existing}");
+        }
+        finally
+        {
+            factory.Identity.NextRegistration = RegistrationOutcome.AwaitingConfirmation;
+        }
+    }
+
     [Fact]
     public async Task Signing_out_revokes_the_refresh_token_rather_than_forgetting_it()
     {

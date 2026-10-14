@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Auctions;
 using Koleksi.Domain.Catalog;
 using Koleksi.Domain.Common;
@@ -30,15 +31,15 @@ public sealed class CreateListingHandler(
     ICategoryRepository categories,
     IMediaStorage media,
     ICurrentUser currentUser,
-    IClock clock)
+    IClock clock,
+    PublicIdentityResolver identities)
 {
     public async Task<CreateListingResult> HandleAsync(CreateListingCommand command, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(command);
 
         var sellerId = currentUser.RequireUserId();
-        var sellerUsername = currentUser.Username
-            ?? throw DomainException.For("listing.no_username", "Your account is missing a username.");
+        var sellerUsername = (await identities.ResolveAsync(sellerId, ct).ConfigureAwait(false)).Handle;
 
         var category = await categories.FindByIdAsync(command.CategoryId, ct).ConfigureAwait(false)
             ?? throw DomainException.For("listing.category_not_found", "Choose a category from the list.");
@@ -51,7 +52,7 @@ public sealed class CreateListingHandler(
         // check the profile-avatar endpoint runs on its own upload.
         foreach (var photo in command.Photos)
         {
-            if (!await media.VerifyUploadedAsync(photo.StorageKey, ct).ConfigureAwait(false))
+            if (!await media.VerifyOwnedUploadAsync(MediaPurpose.ListingPhoto, sellerId, photo.StorageKey, ct).ConfigureAwait(false))
             {
                 throw DomainException.For(
                     "listing.photo_not_uploaded", "One of the photos was not actually uploaded.");
@@ -70,6 +71,12 @@ public sealed class CreateListingHandler(
 
         listing.SetDescription(command.Description, clock);
 
+        // Units on offer. An auction is always one, whatever was sent.
+        if (command.Format != ListingFormat.Auction && command.Stock is { } stock)
+        {
+            listing.SetStock(stock, clock);
+        }
+
         if (command.Photos.Count > 0)
         {
             listing.SetPhotos(
@@ -82,38 +89,34 @@ public sealed class CreateListingHandler(
             listing.SetAutoDeclineThreshold(percent, clock);
         }
 
-        await listings.AddAsync(listing, ct).ConfigureAwait(false);
+        // Remembered on the listing even for a draft, so editing it later shows what was chosen.
+        AuctionLifecycle.ApplyTerms(
+            listing, command.Format, command.AuctionDurationDays, command.ReservePriceRupiah, command.BuyoutPriceRupiah, clock);
 
         if (!command.Publish)
         {
+            await listings.AddAsync(listing, ct).ConfigureAwait(false);
             return new CreateListingResult(listing.Id, Published: false, CanonicalPath: null);
         }
 
-        var expectedVersion = listing.Version;
-
-        // Throws listing.photo_required when there are none — the caller's problem,
+        // Everything that can refuse a publish happens here, in memory, BEFORE anything is stored.
+        // Saving a draft first and publishing second left a draft behind every time the publish was
+        // refused (no photo, an auction term out of range), so a seller who pressed "Publish" and was
+        // told no found an unexpected draft in the dashboard.
+        //
+        // Publish throws listing.photo_required when there are no photos — the caller's problem,
         // propagated unchanged, same as every other domain rule in this codebase.
         listing.Publish(clock);
-        await listings.UpdateAsync(listing, expectedVersion, ct).ConfigureAwait(false);
+
+        // Terms that break an auction rule (a reserve above the buyout, a duration out of range) must
+        // refuse the publish, not leave a live listing with nothing to bid on.
+        var auction = command.Format == ListingFormat.Auction ? AuctionLifecycle.OpenFor(listing, clock) : null;
+
+        await listings.AddAsync(listing, ct).ConfigureAwait(false);
 
         DateTimeOffset? auctionEndsAt = null;
-        if (command.Format == ListingFormat.Auction)
+        if (auction is not null)
         {
-            var duration = TimeSpan.FromDays(command.AuctionDurationDays ?? 1);
-            var reservePrice = command.ReservePriceRupiah is { } reserveRupiah
-                ? Money.TryFromRupiah(reserveRupiah)
-                    ?? throw DomainException.For("auction.invalid_reserve", "Reserve price must be a positive number.")
-                : (Money?)null;
-            var buyoutPrice = command.BuyoutPriceRupiah is { } buyoutRupiah
-                ? Money.TryFromRupiah(buyoutRupiah)
-                    ?? throw DomainException.For("auction.invalid_buyout", "Buyout price must be a positive number.")
-                : (Money?)null;
-            var auction = Auction.Create(listing.Id, sellerId, price, duration, clock, reservePrice, buyoutPrice);
-
-            // Opened immediately rather than left Scheduled: this product has no
-            // "list now, start bidding later" concept, and StartsAt is set to the
-            // moment of creation, so the auction is already startable.
-            auction.Open(clock);
             await auctions.AddAsync(auction, ct).ConfigureAwait(false);
             auctionEndsAt = auction.EndsAt;
         }
@@ -127,7 +130,7 @@ public sealed class CreateListingHandler(
 
 /// <param name="Photos">Empty is fine for a draft; publishing requires at least one.</param>
 /// <param name="AutoDeclineBelowPercent">Only applied when <see cref="Format"/> is <c>AcceptOffers</c>.</param>
-/// <param name="AuctionDurationDays">Only read when <see cref="Format"/> is <c>Auction</c>; defaults to 1.</param>
+/// <param name="AuctionDurationDays">Only kept when <see cref="Format"/> is <c>Auction</c>; stored on the draft and used at publish.</param>
 /// <param name="ReservePriceRupiah">
 /// Only read when <see cref="Format"/> is <c>Auction</c>. Shown openly next to the starting
 /// bid — not a hidden reserve. <c>null</c> means any bid wins.
@@ -154,7 +157,8 @@ public sealed record CreateListingCommand(
     int? AuctionDurationDays,
     long? ReservePriceRupiah,
     long? BuyoutPriceRupiah,
-    bool Publish);
+    bool Publish,
+    int? Stock = null);
 
 public sealed record PhotoInput(string StorageKey, int Width, int Height);
 

@@ -138,8 +138,7 @@ internal sealed class DynamoAuctionRepository(IAmazonDynamoDB dynamo, DynamoOpti
                 ct).ConfigureAwait(false);
         }
         catch (TransactionCanceledException cancelled)
-            when (cancelled.CancellationReasons?.Exists(
-                reason => string.Equals(reason.Code, "ConditionalCheckFailed", StringComparison.Ordinal)) == true)
+            when (DynamoTransactionConflicts.IsConflict(cancelled))
         {
             // Expected under contention, not a fault. The handler re-reads and re-runs the
             // domain rules against the new price rather than merging, because merging two
@@ -181,8 +180,17 @@ internal sealed class DynamoAuctionRepository(IAmazonDynamoDB dynamo, DynamoOpti
         return bids;
     }
 
-    public async Task<IReadOnlyList<Auction>> ListDueForCloseAsync(
-        DateTimeOffset asOf, int limit, CancellationToken ct)
+    public Task<IReadOnlyList<Auction>> ListDueForCloseAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct) =>
+        ListDueAsync(nameof(AuctionStatus.Live), asOf, limit, ct);
+
+    /// <summary>Ended auctions whose winner's payment time is up and not yet settled, longest overdue first.</summary>
+    public Task<IReadOnlyList<Auction>> ListDueForWinnerPaymentAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct) =>
+        ListDueAsync(AuctionItem.WinnerPaymentState, asOf, limit, ct);
+
+    private async Task<IReadOnlyList<Auction>> ListDueAsync(
+        string state, DateTimeOffset asOf, int limit, CancellationToken ct)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
 
@@ -207,8 +215,7 @@ internal sealed class DynamoAuctionRepository(IAmazonDynamoDB dynamo, DynamoOpti
                         $"{DynamoTable.AuctionEndPk} = :pk AND {DynamoTable.AuctionEndSk} <= :now",
                     ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
                     {
-                        [":pk"] = Attr.S(
-                            DynamoTable.AuctionEndPkValue(nameof(AuctionStatus.Live), shard)),
+                        [":pk"] = Attr.S(DynamoTable.AuctionEndPkValue(state, shard)),
 
                         // The sort key is "{instant}#{listingId}", so an inclusive bound on
                         // the instant needs a suffix that sorts above every id. Comparing
@@ -237,8 +244,9 @@ internal sealed class DynamoAuctionRepository(IAmazonDynamoDB dynamo, DynamoOpti
             }
         }
 
-        // Merge the shards back into one close-time order, then honour the caller's limit.
-        due.Sort((left, right) => left.EndsAt.CompareTo(right.EndsAt));
+        // Merge the shards back into one due-time order, then honour the caller's limit.
+        due.Sort((left, right) =>
+            (left.PaymentDueAt ?? left.EndsAt).CompareTo(right.PaymentDueAt ?? right.EndsAt));
         return due.Count > limit ? due.GetRange(0, limit) : due;
     }
 

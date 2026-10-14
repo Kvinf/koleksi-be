@@ -37,6 +37,17 @@ public static class TestData
 
     public const string CardsCategorySlug = "kartu";
 
+    /// <summary>
+    /// A listing-photo key as the media grant would mint it for <paramref name="ownerId"/>, so the
+    /// ownership check accepts it. Uploads are fake in these tests; the key shape is not.
+    /// </summary>
+    public static string PhotoKey(string ownerId, string name = "photo") =>
+        $"listings/{Koleksi.Application.Abstractions.MediaKeys.OwnerSegment(ownerId)}/{name}";
+
+    /// <summary>A media key of any purpose, as the grant would mint it for <paramref name="ownerId"/>.</summary>
+    public static string MediaKey(Koleksi.Application.Abstractions.MediaPurpose purpose, string ownerId, string name = "object") =>
+        $"{Koleksi.Application.Abstractions.MediaKeys.PrefixFor(purpose)}/{Koleksi.Application.Abstractions.MediaKeys.OwnerSegment(ownerId)}/{name}";
+
     /// <summary>An id that is well-formed but belongs to nothing.</summary>
     public static string UnknownListingId => EntityId.New(MutableClock.Origin);
 
@@ -47,6 +58,15 @@ public static class TestData
         ListingFormat format = ListingFormat.FixedPrice)
     {
         var listing = Draft(title, price, format);
+        listing.SetPhotos([ListingPhoto.Create("listing/photo-one.jpg", 1200, 1200)], Clock);
+        listing.Publish(Clock);
+        return listing;
+    }
+
+    /// <summary>An active fixed-price listing owned by <paramref name="sellerId"/> rather than the default seller.</summary>
+    public static Listing ActiveListingBy(string sellerId, string title = "Sealed Gunpla RG Nu Gundam Ver Ka", Money? price = null)
+    {
+        var listing = Draft(title, price, ListingFormat.FixedPrice, sellerId);
         listing.SetPhotos([ListingPhoto.Create("listing/photo-one.jpg", 1200, 1200)], Clock);
         listing.Publish(Clock);
         return listing;
@@ -87,10 +107,10 @@ public static class TestData
         return auction;
     }
 
-    private static Listing Draft(string title, Money? price, ListingFormat format)
+    private static Listing Draft(string title, Money? price, ListingFormat format, string sellerId = SellerId)
     {
         var listing = Listing.CreateDraft(
-            SellerId,
+            sellerId,
             CardsCategoryId,
             title,
             price ?? Money.FromRupiah(2_500_000),

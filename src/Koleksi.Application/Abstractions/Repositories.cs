@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Koleksi.Application.Common;
 using Koleksi.Domain.Auctions;
 using Koleksi.Domain.Catalog;
@@ -61,7 +62,27 @@ public interface IListingRepository
     /// username for every publicly visible listing, so this reads that row instead of
     /// standing up a second subsystem to answer the same question.
     /// </remarks>
+    /// <remarks>
+    /// Legacy and <b>not for display</b>: for an email account the stored value is the email
+    /// address. Public and counter-party-facing names come from <c>PublicIdentityResolver</c>.
+    /// </remarks>
     Task<string?> FindSellerUsernameAsync(string listingId, CancellationToken ct);
+
+    /// <summary>
+    /// How many of a seller's listings currently have <paramref name="status"/>. A count query on
+    /// the seller index (a key-condition prefix), never a read of the listings themselves.
+    /// </summary>
+    Task<int> CountBySellerAsync(string sellerId, ListingStatus status, CancellationToken ct);
+
+    /// <summary>
+    /// The owning seller of each listing id, in one round trip. Ids that do not exist are absent.
+    /// </summary>
+    /// <remarks>
+    /// Serves browse rows written before the projection carried a seller id, so their stored
+    /// (possibly email-shaped) name can be replaced by the seller's public handle.
+    /// </remarks>
+    Task<IReadOnlyDictionary<string, string>> FindSellerIdsAsync(
+        IReadOnlyCollection<string> listingIds, CancellationToken ct);
 }
 
 /// <summary>Reads and writes the one profile document each account holds.</summary>
@@ -155,6 +176,12 @@ public interface IAuctionRepository
 
     /// <summary>Auctions past their end time that have not been closed yet.</summary>
     Task<IReadOnlyList<Auction>> ListDueForCloseAsync(DateTimeOffset asOf, int limit, CancellationToken ct);
+
+    /// <summary>
+    /// Ended auctions whose winner's thirty minutes to pay are up and not yet settled, longest overdue first.
+    /// Same sparse index and caveats as <see cref="ListDueForCloseAsync"/>.
+    /// </summary>
+    Task<IReadOnlyList<Auction>> ListDueForWinnerPaymentAsync(DateTimeOffset asOf, int limit, CancellationToken ct);
 }
 
 /// <summary>Reads and writes offers.</summary>
@@ -175,6 +202,16 @@ public interface IOfferRepository
     /// <summary>An existing unresolved offer from this buyer on this listing, if any.</summary>
     /// <remarks>Used to stop a buyer stacking a dozen simultaneous offers on one item.</remarks>
     Task<Offer?> FindActiveAsync(string listingId, string buyerId, CancellationToken ct);
+
+    /// <summary>
+    /// Every offer on this listing that still occupies its buyer's one open slot (pending,
+    /// countered, accepted, or checked out), as stored: the deadline is not applied.
+    /// </summary>
+    /// <remarks>
+    /// A Query on the listing's own partition (the active-offer pointer rows), never a scan. Used to
+    /// refuse delisting an item with an accepted deal in flight.
+    /// </remarks>
+    Task<IReadOnlyList<Offer>> ListOpenForListingAsync(string listingId, CancellationToken ct);
 }
 
 /// <summary>Reads and writes orders.</summary>
@@ -194,12 +231,32 @@ public interface IOrderRepository
 
     Task UpdateAsync(Order order, long expectedVersion, CancellationToken ct);
 
+    /// <summary>
+    /// Saves a just-released order and the payout it owes in one transaction: both are written or neither,
+    /// so escrow is never released without the seller being owed.
+    /// </summary>
+    /// <exception cref="ConcurrencyConflictException">The order changed since it was read, or its payout already exists.</exception>
+    Task UpdateWithPayoutAsync(Order order, long expectedVersion, Payout payout, CancellationToken ct);
+
     Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct);
 
     Task<Page<Order>> ListForSellerAsync(string sellerId, string? cursor, int limit, CancellationToken ct);
 
-    /// <summary>Delivered orders whose auto-release deadline has passed.</summary>
+    /// <summary>Delivered orders whose auto-release deadline has passed, most overdue first.</summary>
+    /// <remarks>
+    /// Answered from a sparse index, so only orders written with their sweep keys are found:
+    /// rows older than that index are never returned (see the sweep's backfill note).
+    /// </remarks>
     Task<IReadOnlyList<Order>> ListDueForAutoReleaseAsync(DateTimeOffset asOf, int limit, CancellationToken ct);
+
+    /// <summary>Unpaid orders whose payment window has elapsed, most overdue first. Same caveat as above.</summary>
+    Task<IReadOnlyList<Order>> ListPaymentExpiredAsync(DateTimeOffset asOf, int limit, CancellationToken ct);
+
+    /// <summary>
+    /// Shipped orders whose parcel is due to be asked about (<see cref="Order.NextTrackingCheckAt"/> has
+    /// passed), longest-waiting first. Same sparse index and caveat as above.
+    /// </summary>
+    Task<IReadOnlyList<Order>> ListDueForTrackingAsync(DateTimeOffset asOf, int limit, CancellationToken ct);
 }
 
 /// <summary>Reads and writes a buyer's cart — the listings they intend to check out together.</summary>
@@ -211,8 +268,8 @@ public interface IOrderRepository
 /// </remarks>
 public interface ICartRepository
 {
-    /// <summary>Adds a listing, or refreshes it if already present.</summary>
-    Task AddItemAsync(string buyerId, string listingId, DateTimeOffset addedAt, CancellationToken ct);
+    /// <summary>Adds a listing, or refreshes it if already present (the quantity is replaced, not added to).</summary>
+    Task AddItemAsync(string buyerId, string listingId, DateTimeOffset addedAt, CancellationToken ct, int quantity = 1);
 
     /// <summary>Removes a listing. A no-op if it was not there.</summary>
     Task RemoveItemAsync(string buyerId, string listingId, CancellationToken ct);
@@ -222,7 +279,7 @@ public interface ICartRepository
 }
 
 /// <summary>One pointer row in a buyer's cart.</summary>
-public sealed record CartItem(string ListingId, DateTimeOffset AddedAt);
+public sealed record CartItem(string ListingId, DateTimeOffset AddedAt, int Quantity = 1);
 
 /// <summary>Everything the browse projection needs to render one result card.</summary>
 /// <param name="Listing">The listing itself.</param>
@@ -263,7 +320,8 @@ public sealed record ListingSummary(
     string City,
     string? PrimaryPhotoKey,
     DateTimeOffset? AuctionEndsAt,
-    int BidCount);
+    int BidCount,
+    [property: JsonIgnore] string? SellerId = null);
 
 /// <summary>The count for one facet option in the current result set.</summary>
 public sealed record FacetCount(string FacetKey, string Value, long Count);

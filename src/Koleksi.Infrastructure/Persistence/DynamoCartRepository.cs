@@ -18,8 +18,10 @@ namespace Koleksi.Infrastructure.Persistence;
 internal sealed class DynamoCartRepository(IAmazonDynamoDB dynamo, DynamoOptions options) : ICartRepository
 {
     private const string AddedAtAttr = "addedAt";
+    private const string QuantityAttr = "quantity";
 
-    public async Task AddItemAsync(string buyerId, string listingId, DateTimeOffset addedAt, CancellationToken ct)
+    public async Task AddItemAsync(
+        string buyerId, string listingId, DateTimeOffset addedAt, CancellationToken ct, int quantity = 1)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(buyerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(listingId);
@@ -33,6 +35,7 @@ internal sealed class DynamoCartRepository(IAmazonDynamoDB dynamo, DynamoOptions
                     [DynamoTable.Pk] = Attr.S(DynamoTable.CartPk(buyerId)),
                     [DynamoTable.Sk] = Attr.S(DynamoTable.CartItemSk(listingId)),
                     [AddedAtAttr] = Attr.Instant(addedAt),
+                    [QuantityAttr] = Attr.N(Math.Max(1, quantity)),
                 },
             },
             ct).ConfigureAwait(false);
@@ -79,7 +82,11 @@ internal sealed class DynamoCartRepository(IAmazonDynamoDB dynamo, DynamoOptions
         {
             items.Add(new CartItem(
                 item.GetString(DynamoTable.Sk)[prefixLength..],
-                item.GetInstant(AddedAtAttr)));
+                item.GetInstant(AddedAtAttr),
+                // Rows written before quantities existed are one unit.
+                item.TryGetValue(QuantityAttr, out var quantity) && quantity.N is { } quantityText
+                    ? Math.Max(1, int.Parse(quantityText, System.Globalization.CultureInfo.InvariantCulture))
+                    : 1));
         }
 
         return items;

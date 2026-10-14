@@ -53,7 +53,7 @@ public sealed class OfferRepositoryTests : DynamoTestBase
     }
 
     [DynamoLocalFact]
-    public async Task Accepting_an_offer_clears_the_active_offer_pointer()
+    public async Task An_accepted_offer_is_still_the_buyers_open_deal_until_it_is_spent()
     {
         var listing = Fixtures.ActiveListing(format: Koleksi.Domain.Catalog.ListingFormat.AcceptOffers);
         await Table.Listings.AddAsync(listing, Ct);
@@ -63,14 +63,70 @@ public sealed class OfferRepositoryTests : DynamoTestBase
         offer.Accept(listing.SellerId, Fixtures.Clock);
         await Table.Offers.UpdateAsync(offer, expectedVersion: 0, Ct);
 
-        // The buyer is free to make a fresh offer elsewhere — resolved offers do not
-        // block new ones, only an unresolved one does.
-        var active = await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct);
-        active.ShouldBeNull();
+        // Accepted but unpaid: the buyer cannot stack a second offer beside it.
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldNotBeNull();
+        (await Table.Offers.FindAsync(offer.Id, Ct))!.Status.ShouldBe(OfferStatus.Accepted);
 
-        var stored = await Table.Offers.FindAsync(offer.Id, Ct);
-        stored.ShouldNotBeNull();
-        stored.Status.ShouldBe(OfferStatus.Accepted);
+        // Spent: now the buyer is free to make a fresh offer, and the order id is kept.
+        offer.MarkCheckedOut(Fixtures.BidderId, "order-1", Fixtures.Clock);
+        await Table.Offers.UpdateAsync(offer, expectedVersion: 1, Ct);
+
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldBeNull();
+        var stored = (await Table.Offers.FindAsync(offer.Id, Ct))!;
+        stored.Status.ShouldBe(OfferStatus.CheckedOut);
+        stored.OrderId.ShouldBe("order-1");
+    }
+
+    [DynamoLocalFact]
+    public async Task A_counter_is_stored_beside_the_buyers_original_amount()
+    {
+        var listing = Fixtures.ActiveListing(format: Koleksi.Domain.Catalog.ListingFormat.AcceptOffers);
+        await Table.Listings.AddAsync(listing, Ct);
+        var offer = Fixtures.PendingOffer(listing);
+        await Table.Offers.AddAsync(offer, Ct);
+
+        offer.Counter(Money.FromRupiah(listing.Price.Rupiah - 100_000), listing.SellerId, Fixtures.Clock);
+        await Table.Offers.UpdateAsync(offer, expectedVersion: 0, Ct);
+
+        var stored = (await Table.Offers.FindAsync(offer.Id, Ct))!;
+        stored.Status.ShouldBe(OfferStatus.Countered);
+        stored.Amount.Rupiah.ShouldBe(2_000_000);
+        stored.CounterAmount!.Value.Rupiah.ShouldBe(listing.Price.Rupiah - 100_000);
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldNotBeNull();
+    }
+
+    [DynamoLocalFact]
+    public async Task Two_simultaneous_checkouts_of_one_accepted_offer_cannot_both_claim_it()
+    {
+        var listing = Fixtures.ActiveListing(format: Koleksi.Domain.Catalog.ListingFormat.AcceptOffers);
+        await Table.Listings.AddAsync(listing, Ct);
+        var offer = Fixtures.PendingOffer(listing);
+        await Table.Offers.AddAsync(offer, Ct);
+        offer.Accept(listing.SellerId, Fixtures.Clock);
+        await Table.Offers.UpdateAsync(offer, expectedVersion: 0, Ct);
+
+        // Each checkout reads the offer, then tries to spend it with a write conditional on
+        // the version it read. The table lets exactly one of them through.
+        var claims = Enumerable.Range(0, 8).Select(async attempt =>
+        {
+            var copy = (await Table.Offers.FindAsync(offer.Id, Ct))!;
+            var version = copy.Version;
+            copy.MarkCheckedOut(Fixtures.BidderId, $"order-{attempt}", Fixtures.Clock);
+            try
+            {
+                await Table.Offers.UpdateAsync(copy, version, Ct);
+                return true;
+            }
+            catch (ConcurrencyConflictException)
+            {
+                return false;
+            }
+        });
+
+        var results = await Task.WhenAll(claims);
+
+        results.Count(won => won).ShouldBe(1);
+        (await Table.Offers.FindAsync(offer.Id, Ct))!.Status.ShouldBe(OfferStatus.CheckedOut);
     }
 
     [DynamoLocalFact]

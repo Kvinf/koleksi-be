@@ -51,6 +51,20 @@ public sealed class Auction
     /// <summary>Longest auction a seller may schedule.</summary>
     public static readonly TimeSpan MaximumDuration = TimeSpan.FromDays(14);
 
+    /// <summary>
+    /// How long the winner of an <see cref="AuctionStatus.Ended"/> auction has to start paying
+    /// before the item goes back to the seller.
+    /// </summary>
+    /// <remarks>
+    /// Without a deadline a winner who never pays locks the item for ever: the seller cannot
+    /// archive or relist a lot that still has a winner owed (D-01), and nothing else would
+    /// release it. The owner's rule is thirty minutes, to <i>pay</i>, counted from the close: the
+    /// order a winner opens inherits this same deadline rather than getting a fresh window (see
+    /// <c>Order.AuctionPaymentWindow</c>). A winner who misses it is given a warning
+    /// (<c>AccountStanding</c>), and the lot goes back to the seller.
+    /// </remarks>
+    public static readonly TimeSpan WinnerPaymentWindow = Orders.Order.AuctionPaymentWindow;
+
     private Auction(
         string listingId,
         string sellerId,
@@ -102,6 +116,52 @@ public sealed class Auction
     public DateTimeOffset StartsAt { get; }
     public DateTimeOffset EndsAt { get; private set; }
     public AuctionStatus Status { get; private set; }
+
+    /// <summary>
+    /// When the auction actually closed: the sweep's close, or the moment of a buyout (which is
+    /// before <see cref="EndsAt"/>). <c>null</c> while it is open, and on rows stored before this
+    /// was kept.
+    /// </summary>
+    public DateTimeOffset? ClosedAt { get; private set; }
+
+    /// <summary>
+    /// When the winner must have started paying by, or <c>null</c> unless the auction ended with a
+    /// winner. Rows that predate <see cref="ClosedAt"/> count from <see cref="EndsAt"/>.
+    /// </summary>
+    public DateTimeOffset? PaymentDueAt => Status == AuctionStatus.Ended
+        ? (ClosedAt ?? EndsAt) + WinnerPaymentWindow
+        : null;
+
+    /// <summary>
+    /// Whether the winner's time to start paying has run out, so the item is the seller's again.
+    /// Checked lazily wherever it matters (archive, relist, the winner's checkout); no sweep owns it.
+    /// </summary>
+    public bool IsWinnerPaymentLapsed(IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        return PaymentDueAt is { } due && clock.UtcNow >= due;
+    }
+
+    /// <summary>
+    /// When the winner's payment was settled one way or the other: they paid, or their thirty minutes ran
+    /// out and the lapse was recorded. <c>null</c> while it is still open. It is what takes the auction off
+    /// the winner-payment sweep.
+    /// </summary>
+    public DateTimeOffset? WinnerPaymentResolvedAt { get; private set; }
+
+    /// <summary>Records that the winner's payment is settled (paid, or lapsed and dealt with).</summary>
+    public void ResolveWinnerPayment(IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (Status != AuctionStatus.Ended || WinnerPaymentResolvedAt is not null)
+        {
+            return;
+        }
+
+        WinnerPaymentResolvedAt = clock.UtcNow;
+        Version++;
+    }
 
     /// <summary>The bidder currently winning, or <c>null</c> before the first bid.</summary>
     public string? LeadingBidderId { get; private set; }
@@ -204,9 +264,13 @@ public sealed class Auction
         string? leadingBidderUsername,
         long version,
         Money? reservePrice = null,
-        Money? buyoutPrice = null) =>
+        Money? buyoutPrice = null,
+        DateTimeOffset? closedAt = null,
+        DateTimeOffset? winnerPaymentResolvedAt = null) =>
         new(listingId, sellerId, startingBid, reservePrice, buyoutPrice, startsAt, endsAt)
         {
+            ClosedAt = closedAt,
+            WinnerPaymentResolvedAt = winnerPaymentResolvedAt,
             CurrentPrice = currentPrice,
             BidCount = bidCount,
             Status = status,
@@ -265,6 +329,16 @@ public sealed class Auction
                 $"Bid must be at least {NextMinimumBid}.");
         }
 
+        // A bid at or above the buy-it-now price is a buyout in all but name, and as a bid it would
+        // set a visible price the later buyout then LOWERS (a Rp1.5M leader beaten by a Rp1.0M
+        // buyout costs the seller the difference). The bidder who wants the lot pays the buyout.
+        if (BuyoutPrice is { } buyoutCap && amount >= buyoutCap)
+        {
+            throw DomainException.For(
+                "auction.bid_reaches_buyout",
+                $"A bid must be below the buy-it-now price ({buyoutCap}). Use buy it now to take the item.");
+        }
+
         var previousLeader = LeadingBidderId;
         var bid = NewBid(bidderId, bidderUsername, amount, now);
 
@@ -305,6 +379,7 @@ public sealed class Auction
         }
 
         Status = LeadingBidderId is null || !ReserveMet ? AuctionStatus.EndedWithoutSale : AuctionStatus.Ended;
+        ClosedAt = clock.UtcNow;
         Version++;
     }
 
@@ -335,6 +410,16 @@ public sealed class Auction
         var now = clock.UtcNow;
         EnsureBiddable(buyerId, now);
 
+        // A buyout never lowers what the bidding already reached. New bids cannot get here (see
+        // PlaceBid), but an auction stored before that rule can hold a price at or above its buyout,
+        // and selling it at the lower number would hand the difference to the buyer.
+        if (CurrentPrice >= buyoutPrice)
+        {
+            throw DomainException.For(
+                "auction.buyout_unavailable",
+                "Bidding has already reached the buy-it-now price, so it can no longer be used.");
+        }
+
         var previousLeader = LeadingBidderId;
         var bid = NewBid(buyerId, buyerUsername, buyoutPrice, now);
 
@@ -342,6 +427,7 @@ public sealed class Auction
         TakeLead(buyerId, buyerUsername);
         BidCount++;
         Status = AuctionStatus.Ended;
+        ClosedAt = now;
         Version++;
 
         return new BidOutcome(

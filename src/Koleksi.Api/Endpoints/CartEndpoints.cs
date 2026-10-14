@@ -1,6 +1,9 @@
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Cart;
 using Koleksi.Application.Features.Orders;
+using Microsoft.AspNetCore.RateLimiting;
+
+using static Koleksi.Api.Endpoints.IdempotencyHeader;
 
 namespace Koleksi.Api.Endpoints;
 
@@ -20,7 +23,9 @@ internal static class CartEndpoints
         group.MapGet("", GetCartAsync).WithName("GetCart");
         group.MapPost("/items", AddCartItemAsync).WithName("AddCartItem");
         group.MapDelete("/items/{listingId}", RemoveCartItemAsync).WithName("RemoveCartItem");
-        group.MapPost("/checkout", CheckoutCartAsync).WithName("CheckoutCart");
+        group.MapPost("/checkout", CheckoutCartAsync)
+            .RequireRateLimiting(RateLimitPolicies.Checkout)
+            .WithName("CheckoutCart");
 
         return app;
     }
@@ -41,7 +46,7 @@ internal static class CartEndpoints
             return Results.BadRequest(new { code = "cart.invalid_details" });
         }
 
-        var result = await handler.HandleAsync(request.ListingId, ct).ConfigureAwait(false);
+        var result = await handler.HandleAsync(request.ListingId, request.Quantity ?? 1, ct).ConfigureAwait(false);
 
         return result.Found
             ? Results.Ok(new { added = true })
@@ -59,6 +64,8 @@ internal static class CartEndpoints
         CheckoutCartRequest request,
         CheckoutCartHandler handler,
         IIdentityService identity,
+        ICurrentUser user,
+        IIdempotencyStore idempotency,
         HttpRequest http,
         CancellationToken ct)
     {
@@ -67,6 +74,19 @@ internal static class CartEndpoints
         if (request.ListingIds is not { Count: > 0 })
         {
             return Results.BadRequest(new { code = "cart.checkout_empty" });
+        }
+
+        if (request.ListingIds.Count > CheckoutCartHandler.MaxItems)
+        {
+            return Results.BadRequest(new { code = "cart.too_many_items" });
+        }
+
+        // A missing or half-empty address is a malformed request, not a server fault: every
+        // field present and bounded before anything runs. See OrderEndpoints.CheckoutAsync.
+        var shipTo = request.ShipTo?.ToInput();
+        if (shipTo is null || !shipTo.IsValid() || request.ListingIds.Any(string.IsNullOrWhiteSpace))
+        {
+            return Results.BadRequest(new { code = "checkout.invalid_details" });
         }
 
         // Resolved from the caller's own bearer token, never trusted from the body — same
@@ -81,12 +101,18 @@ internal static class CartEndpoints
         var command = new CheckoutCartCommand(
             request.ListingIds,
             email,
-            new ShippingAddressInput(
-                request.ShipTo.RecipientName, request.ShipTo.Phone, request.ShipTo.Street,
-                request.ShipTo.City, request.ShipTo.Province, request.ShipTo.PostalCode),
-            request.CourierCodeBySellerId ?? new Dictionary<string, string>(StringComparer.Ordinal));
+            shipTo,
+            request.CourierCodeByShop ?? new Dictionary<string, string>(StringComparer.Ordinal));
 
-        var result = await handler.HandleAsync(command, ct).ConfigureAwait(false);
+        // A double-tap on "Pay" must not create a second set of orders: the same key replays
+        // the first result. No key, no protection.
+        var result = await idempotency.RunOnceAsync(
+            $"cart.checkout:{user.RequireUserId()}",
+            Read(http),
+            TimeSpan.FromMinutes(10),
+            () => handler.HandleAsync(command, ct),
+            ct,
+            inFlight: InFlightPolicy.Reject).ConfigureAwait(false);
 
         if (!result.Found)
         {
@@ -97,7 +123,7 @@ internal static class CartEndpoints
         {
             orders = result.Orders.Select(order => new
             {
-                sellerId = order.SellerId,
+                shopHandle = order.ShopHandle,
                 orderId = order.OrderId,
                 orderNumber = order.OrderNumber,
                 grandTotalRupiah = order.GrandTotalRupiah,
@@ -115,20 +141,29 @@ internal static class CartEndpoints
         categorySlug = row.CategorySlug,
         priceRupiah = row.PriceRupiah,
         condition = row.Condition,
-        sellerId = row.SellerId,
+        shopHandle = row.ShopHandle,
         sellerUsername = row.SellerUsername,
         sellerCity = row.SellerCity,
         photoUrl = row.PhotoUrl,
         addedAt = row.AddedAt,
+        quantity = row.Quantity,
+        stock = row.Stock,
+        available = row.Available,
     };
 
-    private sealed record AddCartItemRequest(string ListingId);
+    private sealed record AddCartItemRequest(string ListingId, int? Quantity = null);
 
     private sealed record ShippingAddressRequest(
-        string RecipientName, string Phone, string Street, string City, string Province, string PostalCode);
+        string? RecipientName, string? Phone, string? Street, string? City, string? Province, string? PostalCode)
+    {
+        public ShippingAddressInput ToInput() => new(
+            RecipientName ?? string.Empty, Phone ?? string.Empty, Street ?? string.Empty,
+            City ?? string.Empty, Province ?? string.Empty, PostalCode ?? string.Empty);
+    }
 
+    /// <param name="CourierCodeByShop">Courier pick per shop, keyed by the shop handle each cart row carries.</param>
     private sealed record CheckoutCartRequest(
         IReadOnlyList<string> ListingIds,
-        ShippingAddressRequest ShipTo,
-        IReadOnlyDictionary<string, string>? CourierCodeBySellerId);
+        ShippingAddressRequest? ShipTo,
+        IReadOnlyDictionary<string, string>? CourierCodeByShop);
 }

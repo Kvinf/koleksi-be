@@ -28,6 +28,15 @@ public sealed class KoleksiOptions
     /// <summary>AWS region for every SDK client. Empty means "use the ambient default".</summary>
     public string Region { get; init; } = string.Empty;
 
+    /// <summary>
+    /// The deployment stage (`dev`, `staging`, `prod`), set by CDK on every deployed stage. Empty locally. Used for
+    /// exactly one thing today: refusing to start with the simulators on anywhere but dev.
+    /// </summary>
+    public string Stage { get; init; } = string.Empty;
+
+    /// <summary>The stand-ins for the payment gateway, the courier and the payout provider. Off unless asked for.</summary>
+    public SimulatorOptions Simulators { get; init; } = new();
+
     public CognitoOptions Cognito { get; init; } = new();
 
     public DynamoOptions Dynamo { get; init; } = new();
@@ -38,7 +47,14 @@ public sealed class KoleksiOptions
 
     public PaymentOptions Payment { get; init; } = new();
 
+    /// <summary>The courier-tracking provider, if one is chosen. Absent means only the buyer's confirmation releases escrow.</summary>
+    public DeliveryOptions Delivery { get; init; } = new();
+
     public CorsOptions Cors { get; init; } = new();
+
+    public RealtimeOptions Realtime { get; init; } = new();
+
+    public SecurityOptions Security { get; init; } = new();
 
     /// <summary>
     /// Fails fast on a configuration that cannot serve traffic safely in a deployed stage.
@@ -70,7 +86,11 @@ public sealed class KoleksiOptions
         Media.Validate(problems, allowLocalEndpoints);
         Email.Validate(problems);
         Payment.Validate(problems);
+        Delivery.Validate(problems);
+        Simulators.Validate(problems, Stage, allowLocalEndpoints);
         Cors.Validate(problems);
+        Realtime.Validate(problems);
+        Security.Validate(problems);
 
         if (problems.Count > 0)
         {
@@ -234,6 +254,29 @@ public sealed class DynamoOptions
     }
 }
 
+/// <summary>Live updates pushed to open browser pages.</summary>
+public sealed class RealtimeOptions
+{
+    /// <summary>
+    /// The WebSocket API's connection-management endpoint, e.g.
+    /// <c>https://abc123.execute-api.ap-southeast-3.amazonaws.com/dev</c> — where this service
+    /// posts an event to reach a connected browser.
+    /// </summary>
+    /// <remarks>
+    /// Optional. Unset, nothing is pushed: the pages fall back to polling, which is exactly
+    /// what a stage without the WebSocket API (or a local run that has not enabled it) gets.
+    /// </remarks>
+    public string? ManagementUrl { get; init; }
+
+    internal void Validate(List<string> problems)
+    {
+        if (!string.IsNullOrWhiteSpace(ManagementUrl))
+        {
+            KoleksiOptions.RequireAbsoluteHttpsUrl(problems, ManagementUrl, "Realtime:ManagementUrl");
+        }
+    }
+}
+
 /// <summary>Object storage for user-uploaded media.</summary>
 public sealed class MediaOptions
 {
@@ -379,6 +422,85 @@ public sealed class PaymentOptions
             problems.Add(
                 $"{KoleksiOptions.SectionName}:Payment:SecretArn must be a Secrets Manager ARN — "
                 + "the webhook key must never be configured inline.");
+        }
+    }
+}
+
+/// <summary>
+/// The stand-ins that let an order be walked through payment, shipping and payout by hand while the real payment
+/// gateway, courier and payout provider are not connected.
+/// </summary>
+/// <remarks>
+/// Off by default, and refused outright (the host does not start) unless the stage is <c>dev</c> or the host is a
+/// developer's own machine. A deployed staging or production stage can never run with them on, whatever its
+/// environment says: the stage is set by CDK, and CDK itself refuses to set the flag outside dev.
+/// </remarks>
+public sealed class SimulatorOptions
+{
+    public bool Enabled { get; init; }
+
+    internal void Validate(List<string> problems, string stage, bool allowLocalEndpoints)
+    {
+        if (Enabled && !allowLocalEndpoints && !string.Equals(stage, "dev", StringComparison.Ordinal))
+        {
+            problems.Add(
+                $"{KoleksiOptions.SectionName}:Simulators:Enabled is only allowed on a developer's machine or the dev stage "
+                + $"(`{KoleksiOptions.SectionName}:Stage` is '{(string.IsNullOrWhiteSpace(stage) ? "unset" : stage)}'). "
+                + "They stand in for payment and delivery and must never run where real money moves.");
+        }
+    }
+}
+
+/// <summary>The third-party courier-tracking provider.</summary>
+/// <remarks>
+/// Courier tracking is not something the payment gateway provides, so it has its own provider and its own
+/// credentials. <c>Provider</c> names which adapter is wired; the default <c>none</c> keeps today's behaviour
+/// (the buyer confirms receipt) and needs nothing else set.
+/// </remarks>
+public sealed class DeliveryOptions
+{
+    public const string None = "none";
+
+    /// <summary>Provider adapter name: <c>none</c>, or one registered in <c>AddDeliveryProvider</c> (today <c>signed-json</c>).</summary>
+    public string Provider { get; init; } = None;
+
+    /// <summary>The provider's API base, for the adapters that ask or register parcels. Https only.</summary>
+    public string BaseUrl { get; init; } = string.Empty;
+
+    /// <summary>Secrets Manager ARN of the key that signs the provider's webhooks. An ARN, never the key.</summary>
+    public string WebhookSecretArn { get; init; } = string.Empty;
+
+    /// <summary>Secrets Manager ARN of the API key used to call the provider. An ARN, never the key.</summary>
+    public string ApiKeySecretArn { get; init; } = string.Empty;
+
+    public bool IsConfigured => !string.Equals(Provider, None, StringComparison.OrdinalIgnoreCase);
+
+    internal void Validate(List<string> problems)
+    {
+        if (!IsConfigured)
+        {
+            return;
+        }
+
+        KoleksiOptions.RequireText(problems, WebhookSecretArn, "Delivery:WebhookSecretArn");
+        RequireArn(problems, WebhookSecretArn, "Delivery:WebhookSecretArn");
+
+        if (!string.IsNullOrWhiteSpace(BaseUrl))
+        {
+            KoleksiOptions.RequireAbsoluteHttpsUrl(problems, BaseUrl, "Delivery:BaseUrl");
+        }
+
+        if (!string.IsNullOrWhiteSpace(ApiKeySecretArn))
+        {
+            RequireArn(problems, ApiKeySecretArn, "Delivery:ApiKeySecretArn");
+        }
+    }
+
+    private static void RequireArn(List<string> problems, string value, string name)
+    {
+        if (!string.IsNullOrWhiteSpace(value) && !value.StartsWith("arn:aws:secretsmanager:", StringComparison.Ordinal))
+        {
+            problems.Add($"{KoleksiOptions.SectionName}:{name} must be a Secrets Manager ARN: a key is never configured inline.");
         }
     }
 }

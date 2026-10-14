@@ -34,6 +34,12 @@ internal static class BrowseProjectionItem
     public const string StatusAttr = "status";
     public const string ConditionAttr = "condition";
     public const string SellerUsernameAttr = "sellerUsername";
+
+    /// <summary>
+    /// The owning account, so the seller's public handle can be resolved at read time. Absent on
+    /// rows indexed before it existed; the browse handler looks those up from the listing.
+    /// </summary>
+    public const string SellerIdAttr = "sellerId";
     public const string CityAttr = "city";
     public const string PrimaryPhotoAttr = "primaryPhoto";
     public const string AuctionEndsAtAttr = "auctionEndsAt";
@@ -71,6 +77,7 @@ internal static class BrowseProjectionItem
             [StatusAttr] = Attr.EnumValue(listing.Status),
             [ConditionAttr] = Attr.S(listing.Condition),
             [SellerUsernameAttr] = Attr.S(sellerUsername),
+            [SellerIdAttr] = Attr.S(listing.SellerId),
             [CityAttr] = Attr.S(listing.City),
             [PrimaryPhotoAttr] = Attr.SOrNull(
                 listing.Photos.Count > 0 ? listing.Photos[0].StorageKey : null),
@@ -116,5 +123,6 @@ internal static class BrowseProjectionItem
         City: item.GetString(CityAttr),
         PrimaryPhotoKey: item.GetStringOrNull(PrimaryPhotoAttr),
         AuctionEndsAt: item.GetInstantOrNull(AuctionEndsAtAttr),
-        BidCount: (int)item.GetLongOrDefault(BidCountAttr));
+        BidCount: (int)item.GetLongOrDefault(BidCountAttr),
+        SellerId: item.GetStringOrNull(SellerIdAttr));
 }

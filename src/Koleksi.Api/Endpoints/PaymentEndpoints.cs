@@ -1,3 +1,4 @@
+using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Orders;
 
 namespace Koleksi.Api.Endpoints;
@@ -23,19 +24,66 @@ internal static class PaymentEndpoints
         return app;
     }
 
+    /// <summary>
+    /// Largest webhook body read. A real notification is a few hundred bytes; the cap exists so an
+    /// unauthenticated caller cannot make this endpoint buffer and hash an arbitrarily large body
+    /// before the signature is even looked at.
+    /// </summary>
+    internal const int MaxWebhookBodyBytes = 64 * 1024;
+
     private static async Task<IResult> HandleWebhookAsync(
         HttpRequest http, ConfirmOrderPaymentHandler handler, CancellationToken ct)
     {
+        var tooLarge = Results.Json(
+            new { code = "payment.payload_too_large" }, statusCode: StatusCodes.Status413PayloadTooLarge);
+
+        if (http.ContentLength > MaxWebhookBodyBytes)
+        {
+            return tooLarge;
+        }
+
         // Read as raw text before anything parses it. The signature covers the exact
         // bytes the gateway sent; re-serialised JSON would not reproduce them byte for
-        // byte and would silently fail every genuine notification.
-        using var reader = new StreamReader(http.Body);
+        // byte and would silently fail every genuine notification. The read itself is bounded
+        // too: a chunked body carries no Content-Length to check up front.
+        var buffer = new byte[MaxWebhookBodyBytes + 1];
+        var total = 0;
+        while (total < buffer.Length)
+        {
+            var read = await http.Body.ReadAsync(buffer.AsMemory(total), ct).ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            total += read;
+        }
+
+        if (total > MaxWebhookBodyBytes)
+        {
+            return tooLarge;
+        }
+
+        using var reader = new StreamReader(new MemoryStream(buffer, 0, total));
         var rawBody = await reader.ReadToEndAsync(ct).ConfigureAwait(false);
 
         var headers = http.Headers.ToDictionary(
             header => header.Key, header => header.Value.ToString(), StringComparer.OrdinalIgnoreCase);
 
-        var result = await handler.HandleAsync(rawBody, headers, ct).ConfigureAwait(false);
+        ConfirmOrderPaymentResult result;
+        try
+        {
+            result = await handler.HandleAsync(rawBody, headers, ct).ConfigureAwait(false);
+        }
+        catch (PaymentVerificationUnavailableException)
+        {
+            // The signing key could not be read (already logged at error level with the cause). 503 with
+            // a retry hint, not a bare 500: the notification may be perfectly genuine, and a 5xx is what
+            // makes the gateway deliver it again once the key is readable.
+            http.HttpContext.Response.Headers.RetryAfter = "30";
+            return Results.Json(
+                new { code = "payment.verification_unavailable" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
 
         if (!result.Verified)
         {

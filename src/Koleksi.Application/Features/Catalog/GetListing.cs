@@ -1,6 +1,7 @@
 using Koleksi.Application.Abstractions;
 using Koleksi.Domain.Auctions;
 using Koleksi.Domain.Catalog;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Common;
 
 namespace Koleksi.Application.Features.Catalog;
@@ -27,8 +28,10 @@ public sealed class GetListingHandler(
     IAuctionRepository auctions,
     ICategoryRepository categories,
     IMediaStorage media,
+    IListingHoldStore holds,
     ICurrentUser currentUser,
-    IClock clock)
+    IClock clock,
+    PublicIdentityResolver identities)
 {
     /// <summary>How many history rows the auction page shows.</summary>
     private const int BidHistoryLimit = 25;
@@ -57,17 +60,30 @@ public sealed class GetListingHandler(
 
         var category = await categories.FindByIdAsync(listing.CategoryId, ct).ConfigureAwait(false);
 
+        // The seller as the public knows them: a handle and an optional display name, never the
+        // sign-in name stored on older rows (which for an email account is the email address).
+        var seller = await identities.ResolveAsync(listing.SellerId, ct).ConfigureAwait(false);
+
         AuctionView? auctionView = null;
         if (listing.Format == ListingFormat.Auction)
         {
             var auction = await auctions.FindAsync(listing.Id, ct).ConfigureAwait(false);
             if (auction is not null)
             {
-                var history = await auctions
+                // Only this round's bids: a lot relisted after it ended unsold (or unpaid) runs a fresh
+                // auction over the same listing id, and the earlier round's bid rows are still stored.
+                var history = (await auctions
                     .GetBidHistoryAsync(listing.Id, BidHistoryLimit, ct)
-                    .ConfigureAwait(false);
+                    .ConfigureAwait(false))
+                    .Where(bid => bid.PlacedAt >= auction.StartsAt)
+                    .ToList();
 
-                auctionView = BuildAuctionView(auction, history);
+                // Bidders are named by their current handle, masked below. The name stored on the
+                // bid was the sign-in name at the time and is not trusted for display.
+                var bidders = await identities
+                    .ResolveManyAsync(history.Select(bid => bid.BidderId), ct).ConfigureAwait(false);
+
+                auctionView = BuildAuctionView(auction, history, bidders);
             }
         }
 
@@ -76,7 +92,18 @@ public sealed class GetListingHandler(
         {
             // The domain stores keys, never URLs. The public URL is composed here, from our
             // own CDN base, so a listing can never point a browser at a host we do not own.
-            photos.Add(new PhotoView(media.PublicUrl(photo.StorageKey), photo.Width, photo.Height));
+            // Original, explicitly: this is the detail page's own hero image, the one spot
+            // the full-resolution upload is actually worth its weight.
+            photos.Add(new PhotoView(media.PublicUrl(photo.StorageKey, PhotoSize.Original), photo.Width, photo.Height));
+        }
+
+        // How many units a buyer could take right now. A listing that is not for sale (a draft, an archived
+        // one) has nothing reserved, so it reads as its full stock.
+        StockView? stockView = null;
+        if (listing.Format != ListingFormat.Auction)
+        {
+            var usage = await holds.GetAvailabilityAsync(listing.Id, listing.Stock, ct).ConfigureAwait(false);
+            stockView = new StockView(listing.Stock, usage.Available, usage.Sold, usage.Held);
         }
 
         return new ListingDetailResult(
@@ -87,7 +114,9 @@ public sealed class GetListingHandler(
             Auction: auctionView,
             CanonicalPath: category is null ? null : listing.UrlPath(category.Slug),
             IsOwnListing: currentUser.IsAuthenticated
-                && string.Equals(listing.SellerId, currentUser.UserId, StringComparison.Ordinal));
+                && string.Equals(listing.SellerId, currentUser.UserId, StringComparison.Ordinal),
+            Seller: new PublicSellerView(seller.Handle, seller.DisplayName),
+            Stock: stockView);
     }
 
     private bool IsVisibleTo(Listing listing)
@@ -109,14 +138,15 @@ public sealed class GetListingHandler(
             && string.Equals(listing.SellerId, currentUser.UserId, StringComparison.Ordinal);
     }
 
-    private AuctionView BuildAuctionView(Auction auction, IReadOnlyList<Bid> history)
+    private AuctionView BuildAuctionView(
+        Auction auction, List<Bid> history, IReadOnlyDictionary<string, Koleksi.Domain.Users.PublicProfile> bidders)
     {
         var rows = new List<BidRowView>(history.Count);
         foreach (var bid in history)
         {
             rows.Add(new BidRowView(
                 // Masked at the boundary. The unmasked handle never enters the result.
-                BidderAlias.Mask(bid.BidderUsername),
+                BidderAlias.Mask(bidders[bid.BidderId].Handle),
                 bid.Amount.Rupiah,
                 bid.PlacedAt,
                 IsMine: currentUser.IsAuthenticated
@@ -146,7 +176,14 @@ public sealed class GetListingHandler(
                 && string.Equals(auction.LeadingBidderId, viewerId, StringComparison.Ordinal),
 
             ViewerHasBid: rows.Exists(row => row.IsMine),
-            History: rows);
+            History: rows,
+
+            // Only the winner is told when the time to pay runs out; nobody else has a use for it.
+            PaymentDueAt: viewerId is not null
+                && auction.Status == AuctionStatus.Ended
+                && string.Equals(auction.LeadingBidderId, viewerId, StringComparison.Ordinal)
+                ? auction.PaymentDueAt
+                : null);
     }
 }
 
@@ -166,11 +203,23 @@ public sealed record ListingDetailResult(
     IReadOnlyList<PhotoView> Photos,
     AuctionView? Auction,
     string? CanonicalPath,
-    bool IsOwnListing)
+    bool IsOwnListing,
+    PublicSellerView? Seller = null,
+    StockView? Stock = null)
 {
     public static ListingDetailResult NotFound { get; } =
         new(false, null, null, [], null, null, false);
 }
+
+/// <summary>How many units a listing has, and how many a buyer could reserve right now.</summary>
+/// <param name="Total">Units the seller listed.</param>
+/// <param name="Available">Free to reserve now. Zero with <paramref name="Held"/> above zero means "being paid for; may come back".</param>
+/// <param name="Sold">Units already paid for.</param>
+/// <param name="Held">Units reserved by unpaid orders whose time has not run out.</param>
+public sealed record StockView(int Total, int Available, int Sold, int Held);
+
+/// <summary>The seller as shown on a listing: the handle that links to their storefront, and the name they chose to show.</summary>
+public sealed record PublicSellerView(string Handle, string? DisplayName);
 
 /// <param name="Url">Absolute CDN URL, composed from our own base and the stored key.</param>
 public sealed record PhotoView(string Url, int Width, int Height);
@@ -184,6 +233,9 @@ public sealed record PhotoView(string Url, int Width, int Height);
 /// <param name="BuyoutPriceRupiah">
 /// A fixed price that ends the auction immediately as a sale, at any point in bidding.
 /// <c>null</c> means there is no buyout.
+/// </param>
+/// <param name="PaymentDueAt">
+/// When the winner must have paid by, shown only to the winner of an ended auction; <c>null</c> for everyone else.
 /// </param>
 public sealed record AuctionView(
     AuctionStatus Status,
@@ -199,7 +251,8 @@ public sealed record AuctionView(
     IReadOnlyList<BidRowView> History,
     long? ReservePriceRupiah,
     bool ReserveMet,
-    long? BuyoutPriceRupiah);
+    long? BuyoutPriceRupiah,
+    DateTimeOffset? PaymentDueAt = null);
 
 /// <param name="MaskedBidder">The handle as <c>ran•••hw</c>. The real one never leaves the server.</param>
 /// <param name="IsMine">Lets the design highlight the viewer's own rows without naming anyone.</param>

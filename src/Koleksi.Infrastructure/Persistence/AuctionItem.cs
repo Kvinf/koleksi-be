@@ -21,6 +21,11 @@ internal static class AuctionItem
     private const string LeadingBidderIdAttr = "leadingBidderId";
     private const string LeadingBidderUsernameAttr = "leadingBidderUsername";
     private const string VersionAttr = "version";
+    private const string ClosedAtAttr = "closedAt";
+    private const string WinnerPaymentResolvedAtAttr = "winnerPaymentResolvedAt";
+
+    /// <summary>The due-index state for an ended auction whose winner has not yet paid or lapsed.</summary>
+    public const string WinnerPaymentState = "WinnerPay";
 
     public static string VersionAttribute => VersionAttr;
 
@@ -46,6 +51,8 @@ internal static class AuctionItem
             [LeadingBidderUsernameAttr] = Attr.SOrNull(auction.LeadingBidderUsername),
 
             [VersionAttr] = Attr.N(auction.Version),
+            [ClosedAtAttr] = Attr.InstantOrNull(auction.ClosedAt),
+            [WinnerPaymentResolvedAtAttr] = Attr.InstantOrNull(auction.WinnerPaymentResolvedAt),
         };
 
         // The close-time index is sparse: only a live auction carries the key attributes,
@@ -57,6 +64,16 @@ internal static class AuctionItem
                 DynamoTable.AuctionEndPkValue(nameof(AuctionStatus.Live), DynamoTable.ShardOf(auction.ListingId)));
             item[DynamoTable.AuctionEndSk] = Attr.S(
                 DynamoTable.AuctionEndSkValue(auction.EndsAt, auction.ListingId));
+        }
+        else if (auction.Status == AuctionStatus.Ended
+            && auction.WinnerPaymentResolvedAt is null
+            && auction.PaymentDueAt is { } paymentDue)
+        {
+            // An ended auction with a winner is due once the winner's thirty minutes are up, until it is
+            // resolved (paid, or the lapse recorded), which writes the item without these attributes.
+            item[DynamoTable.AuctionEndPk] = Attr.S(
+                DynamoTable.AuctionEndPkValue(WinnerPaymentState, DynamoTable.ShardOf(auction.ListingId)));
+            item[DynamoTable.AuctionEndSk] = Attr.S(DynamoTable.AuctionEndSkValue(paymentDue, auction.ListingId));
         }
 
         return item;
@@ -75,7 +92,9 @@ internal static class AuctionItem
         leadingBidderUsername: item.GetStringOrNull(LeadingBidderUsernameAttr),
         version: item.GetLongOrDefault(VersionAttr),
         reservePrice: item.GetMoneyOrNull(ReservePriceAttr),
-        buyoutPrice: item.GetMoneyOrNull(BuyoutPriceAttr));
+        buyoutPrice: item.GetMoneyOrNull(BuyoutPriceAttr),
+        closedAt: item.GetInstantOrNull(ClosedAtAttr),
+        winnerPaymentResolvedAt: item.GetInstantOrNull(WinnerPaymentResolvedAtAttr));
 }
 
 /// <summary>Maps a <see cref="Bid"/> to and from its stored item.</summary>

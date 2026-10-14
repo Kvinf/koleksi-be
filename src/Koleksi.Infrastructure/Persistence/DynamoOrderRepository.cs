@@ -7,7 +7,8 @@ using Koleksi.Domain.Orders;
 namespace Koleksi.Infrastructure.Persistence;
 
 /// <summary>Stores orders, and the pointer that resolves an order number back to its id.</summary>
-internal sealed class DynamoOrderRepository(IAmazonDynamoDB dynamo, DynamoOptions options) : IOrderRepository
+internal sealed partial class DynamoOrderRepository(IAmazonDynamoDB dynamo, DynamoOptions options)
+    : IOrderRepository, IOrderSweepBackfill
 {
     private const string OrderNumberAttr = "orderId";
 
@@ -90,8 +91,7 @@ internal sealed class DynamoOrderRepository(IAmazonDynamoDB dynamo, DynamoOption
                 new TransactWriteItemsRequest { TransactItems = writes }, ct).ConfigureAwait(false);
         }
         catch (TransactionCanceledException cancelled)
-            when (cancelled.CancellationReasons?.Exists(
-                reason => string.Equals(reason.Code, "ConditionalCheckFailed", StringComparison.Ordinal)) == true)
+            when (DynamoTransactionConflicts.IsConflict(cancelled))
         {
             // Order ids are UUIDv7 and order numbers are derived from them, so a genuine
             // collision is not the realistic cause — a retried checkout resubmitting the
@@ -129,6 +129,56 @@ internal sealed class DynamoOrderRepository(IAmazonDynamoDB dynamo, DynamoOption
         }
     }
 
+    public async Task UpdateWithPayoutAsync(Order order, long expectedVersion, Payout payout, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(payout);
+
+        try
+        {
+            await dynamo.TransactWriteItemsAsync(
+                new TransactWriteItemsRequest
+                {
+                    TransactItems =
+                    [
+                        new TransactWriteItem
+                        {
+                            Put = new Put
+                            {
+                                TableName = options.TableName,
+                                Item = OrderItem.ToItem(order),
+                                ConditionExpression = "#v = :expected",
+                                ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
+                                {
+                                    ["#v"] = OrderItem.VersionAttribute,
+                                },
+                                ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                                {
+                                    [":expected"] = Attr.N(expectedVersion),
+                                },
+                            },
+                        },
+                        new TransactWriteItem
+                        {
+                            Put = new Put
+                            {
+                                TableName = options.TableName,
+                                Item = PayoutItem.ToItem(payout),
+
+                                // One payout per order, whatever happens twice.
+                                ConditionExpression = $"attribute_not_exists({DynamoTable.Pk})",
+                            },
+                        },
+                    ],
+                },
+                ct).ConfigureAwait(false);
+        }
+        catch (TransactionCanceledException cancelled) when (DynamoTransactionConflicts.IsConflict(cancelled))
+        {
+            throw new ConcurrencyConflictException($"Order '{order.Id}' changed since it was read, or its payout already exists.");
+        }
+    }
+
     public Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct) =>
         QueryIndexAsync(
             DynamoTable.BuyerIndex, DynamoTable.BuyerPk, DynamoTable.BuyerPkValue(buyerId),
@@ -139,55 +189,78 @@ internal sealed class DynamoOrderRepository(IAmazonDynamoDB dynamo, DynamoOption
             DynamoTable.SellerIndex, DynamoTable.SellerPk, DynamoTable.SellerPkValue(sellerId),
             DynamoTable.SellerSk, cursor, limit, ct);
 
-    /// <summary>
-    /// Delivered orders whose auto-release deadline has passed.
-    /// </summary>
+    /// <summary>Delivered orders whose auto-release deadline has passed.</summary>
     /// <remarks>
-    /// Nothing calls this yet — the release sweep itself is out of scope here, the same
-    /// documented gap as the auction close sweep (see <c>ListDueForCloseAsync</c>'s own
-    /// remarks). Implemented as a table scan with a filter rather than a purpose-built
-    /// sparse index, which is the wrong trade for a caller that runs on every request but
-    /// the right one for a method nothing invokes: building <c>gsi_auction_end</c>'s
-    /// sharded-index machinery for a sweep that does not exist yet would be speculative.
-    /// Revisit alongside actually building the sweep.
+    /// A query on the sparse close-time index (see <see cref="DynamoTable.OrderDuePkValue"/>), never a
+    /// scan. Orders written before that index entry existed carry no key and are not found here.
     /// </remarks>
-    public async Task<IReadOnlyList<Order>> ListDueForAutoReleaseAsync(
-        DateTimeOffset asOf, int limit, CancellationToken ct)
+    public Task<IReadOnlyList<Order>> ListDueForAutoReleaseAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct) =>
+        ListDueAsync(nameof(EscrowState.Delivered), asOf, limit, ct);
+
+    /// <summary>Unpaid orders whose payment window has elapsed.</summary>
+    /// <remarks>Same index and caveats as <see cref="ListDueForAutoReleaseAsync"/>.</remarks>
+    public Task<IReadOnlyList<Order>> ListPaymentExpiredAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct) =>
+        ListDueAsync(nameof(EscrowState.AwaitingPayment), asOf, limit, ct);
+
+    /// <summary>Shipped parcels whose next courier check is due.</summary>
+    /// <remarks>Same index and caveats as <see cref="ListDueForAutoReleaseAsync"/>.</remarks>
+    public Task<IReadOnlyList<Order>> ListDueForTrackingAsync(
+        DateTimeOffset asOf, int limit, CancellationToken ct) =>
+        ListDueAsync(OrderItem.TrackingState, asOf, limit, ct);
+
+    private async Task<IReadOnlyList<Order>> ListDueAsync(
+        string state, DateTimeOffset asOf, int limit, CancellationToken ct)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
 
-        var due = new List<Order>();
-        Dictionary<string, AttributeValue>? exclusiveStartKey = null;
+        // Fan out over the shards and merge, exactly as the auction close sweep does: sequential
+        // queries would make the latency the sum of four round trips for no reason.
+        var perShard = Math.Max(1, limit / DynamoTable.AuctionShardCount);
+        var queries = new Task<QueryResponse>[DynamoTable.AuctionShardCount];
 
-        do
+        for (var shard = 0; shard < DynamoTable.AuctionShardCount; shard++)
         {
-            var response = await dynamo.ScanAsync(
-                new ScanRequest
+            queries[shard] = dynamo.QueryAsync(
+                new QueryRequest
                 {
                     TableName = options.TableName,
-                    FilterExpression = $"{DynamoTable.EntityType} = :type AND escrowState = :delivered",
+
+                    // The index projects ALL attributes, which the order needs to be rehydrated.
+                    IndexName = DynamoTable.AuctionEndIndex,
+                    KeyConditionExpression =
+                        $"{DynamoTable.AuctionEndPk} = :pk AND {DynamoTable.AuctionEndSk} <= :now",
                     ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
                     {
-                        [":type"] = Attr.S(OrderItem.TypeName),
-                        [":delivered"] = Attr.EnumValue(EscrowState.Delivered),
-                    },
-                    ExclusiveStartKey = exclusiveStartKey,
-                },
-                ct).ConfigureAwait(false);
+                        [":pk"] = Attr.S(DynamoTable.OrderDuePkValue(state, shard)),
 
+                        // Inclusive of the whole tick, for the reason documented on EndsAtUpperBound.
+                        [":now"] = Attr.S(DynamoTable.EndsAtUpperBound(asOf)),
+                    },
+                    Limit = perShard,
+
+                    // Longest overdue first.
+                    ScanIndexForward = true,
+                },
+                ct);
+        }
+
+        var responses = await Task.WhenAll(queries).ConfigureAwait(false);
+
+        var due = new List<(DateTimeOffset DueAt, Order Order)>();
+        foreach (var response in responses)
+        {
             foreach (var item in response.Items ?? [])
             {
                 var order = OrderItem.ToDomain(item);
-                if (order.AutoReleaseAt is { } autoReleaseAt && autoReleaseAt <= asOf)
-                {
-                    due.Add(order);
-                }
+                due.Add((OrderItem.DueEntryFor(order)?.DueAt ?? order.CreatedAt, order));
             }
+        }
 
-            exclusiveStartKey = response.LastEvaluatedKey is { Count: > 0 } key ? key : null;
-        } while (exclusiveStartKey is not null && due.Count < limit);
-
-        return due.Count > limit ? due.GetRange(0, limit) : due;
+        // Back into one most-overdue-first order, then the caller's limit.
+        due.Sort((left, right) => left.DueAt.CompareTo(right.DueAt));
+        return due.Take(limit).Select(entry => entry.Order).ToList();
     }
 
     private async Task<Page<Order>> QueryIndexAsync(

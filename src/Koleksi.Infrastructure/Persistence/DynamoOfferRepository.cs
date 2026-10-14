@@ -70,8 +70,7 @@ internal sealed class DynamoOfferRepository(IAmazonDynamoDB dynamo, DynamoOption
                 new TransactWriteItemsRequest { TransactItems = writes }, ct).ConfigureAwait(false);
         }
         catch (TransactionCanceledException cancelled)
-            when (cancelled.CancellationReasons?.Exists(
-                reason => string.Equals(reason.Code, "ConditionalCheckFailed", StringComparison.Ordinal)) == true)
+            when (DynamoTransactionConflicts.IsConflict(cancelled))
         {
             throw new ConcurrencyConflictException($"An offer already exists with id '{offer.Id}'.");
         }
@@ -108,17 +107,34 @@ internal sealed class DynamoOfferRepository(IAmazonDynamoDB dynamo, DynamoOption
             [DynamoTable.Sk] = Attr.S(DynamoTable.OfferActiveSk(offer.BuyerId)),
         };
 
+        // The pointer is only ever this offer's own. Writing it is conditioned on that, so reopening
+        // a stale or legacy offer cannot overwrite a different open offer's pointer (which would
+        // leave the buyer with two open offers on one listing); it fails as a conflict instead. A
+        // missing pointer passes: an offer stored before checked-out offers kept theirs has none.
+        var pointerNames = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["#offerId"] = OfferActivePointerItem.OfferIdAttribute,
+        };
+
         writes.Add(new TransactWriteItem
         {
             // Still open (a counter restarts the window but stays active): the pointer's
-            // value never actually changes, but it is easiest to reason about as an
-            // unconditional overwrite rather than special-casing "no-op when unchanged".
-            // Resolved: the pointer is removed, freeing the buyer to make a fresh offer.
+            // value never actually changes. Resolved: the pointer is removed, freeing the
+            // buyer to make a fresh offer. A checked-out offer is still open: its pointer stays
+            // until the deal is reopened or resolved, so the buyer cannot make a second offer
+            // beside it (D-08). The delete is unconditional on purpose: refusing it would leave
+            // an offer that can never be resolved.
             Put = OfferItem.IsActiveStatus(offer.Status)
                 ? new Put
                 {
                     TableName = options.TableName,
                     Item = OfferActivePointerItem.ToItem(offer.ListingId, offer.BuyerId, offer.Id),
+                    ConditionExpression = $"attribute_not_exists({DynamoTable.Pk}) OR #offerId = :thisOffer",
+                    ExpressionAttributeNames = pointerNames,
+                    ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                    {
+                        [":thisOffer"] = Attr.S(offer.Id),
+                    },
                 }
                 : null,
             Delete = OfferItem.IsActiveStatus(offer.Status)
@@ -132,8 +148,7 @@ internal sealed class DynamoOfferRepository(IAmazonDynamoDB dynamo, DynamoOption
                 new TransactWriteItemsRequest { TransactItems = writes }, ct).ConfigureAwait(false);
         }
         catch (TransactionCanceledException cancelled)
-            when (cancelled.CancellationReasons?.Exists(
-                reason => string.Equals(reason.Code, "ConditionalCheckFailed", StringComparison.Ordinal)) == true)
+            when (DynamoTransactionConflicts.IsConflict(cancelled))
         {
             throw new ConcurrencyConflictException($"Offer '{offer.Id}' changed since it was read.");
         }
@@ -172,6 +187,52 @@ internal sealed class DynamoOfferRepository(IAmazonDynamoDB dynamo, DynamoOption
         }
 
         return await FindAsync(OfferActivePointerItem.GetOfferId(pointerItem), ct).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<Offer>> ListOpenForListingAsync(string listingId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(listingId);
+
+        // The pointers all sit in the listing's own partition, so this is one Query on a key (a
+        // page or two at most: a buyer has one open offer per listing, and they lapse in a day).
+        var offerIds = new List<string>();
+        Dictionary<string, AttributeValue>? startKey = null;
+        do
+        {
+            var response = await dynamo.QueryAsync(
+                new QueryRequest
+                {
+                    TableName = options.TableName,
+                    KeyConditionExpression = $"{DynamoTable.Pk} = :pk AND begins_with({DynamoTable.Sk}, :prefix)",
+                    ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                    {
+                        [":pk"] = Attr.S(DynamoTable.ListingPk(listingId)),
+                        [":prefix"] = Attr.S(DynamoTable.OfferActiveSkPrefix()),
+                    },
+                    ConsistentRead = true,
+                    ExclusiveStartKey = startKey,
+                },
+                ct).ConfigureAwait(false);
+
+            foreach (var item in response.Items ?? [])
+            {
+                offerIds.Add(OfferActivePointerItem.GetOfferId(item));
+            }
+
+            startKey = response.LastEvaluatedKey is { Count: > 0 } next ? next : null;
+        }
+        while (startKey is not null);
+
+        var offers = new List<Offer>(offerIds.Count);
+        foreach (var offerId in offerIds)
+        {
+            if (await FindAsync(offerId, ct).ConfigureAwait(false) is { } offer && OfferItem.IsActiveStatus(offer.Status))
+            {
+                offers.Add(offer);
+            }
+        }
+
+        return offers;
     }
 
     private async Task<Page<Offer>> QueryIndexAsync(

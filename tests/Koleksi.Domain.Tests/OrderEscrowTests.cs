@@ -111,13 +111,24 @@ public sealed class OrderEscrowTests
     }
 
     [Fact]
-    public void Funds_cannot_be_released_before_delivery()
+    public void Funds_cannot_be_released_before_the_parcel_is_shipped()
     {
         var (order, clock) = PaidOrder();
-        order.MarkShipped(ValidShipment(), Seller, clock);
 
         Should.Throw<DomainException>(() => order.Release(confirmedByBuyer: true, clock))
             .Code.ShouldBe("order.not_releasable");
+    }
+
+    [Fact]
+    public void The_timed_release_never_starts_before_a_courier_reported_delivery()
+    {
+        var (order, clock) = PaidOrder();
+        order.MarkShipped(ValidShipment(), Seller, clock);
+        clock.Advance(TimeSpan.FromDays(30));
+
+        Should.Throw<DomainException>(() => order.Release(confirmedByBuyer: false, clock))
+            .Code.ShouldBe("order.not_releasable");
+        order.EscrowState.ShouldBe(EscrowState.Shipped);
     }
 
     [Fact]

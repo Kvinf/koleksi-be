@@ -2,12 +2,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Koleksi.Api;
-#if DEBUG
 using Koleksi.Api.Development;
-#endif
 using Koleksi.Api.Endpoints;
 using Koleksi.Api.Middleware;
-using Koleksi.Api.Realtime;
 using Koleksi.Api.Security;
 using Koleksi.Application;
 using Koleksi.Application.Abstractions;
@@ -171,6 +168,29 @@ builder.Services.AddRateLimiter(options =>
     // a whole city; keying solely on identity would leave anonymous traffic unlimited.
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
     {
+        // Public catalogue reads (browse, item page, categories, a seller's public shop) are what every page view of the site
+        // spends: the web tier makes 2 to 4 API calls per page. On the general budget below, about 15
+        // page views a minute from one address exhausted it and every page turned into an error, and
+        // a mobile carrier's shared address makes that ordinary rather than abusive. They get a
+        // separate, larger bucket per address, apart from everything else so spending it never
+        // starves a sign-in or a write. The data is public, identical for everyone and cheap to
+        // serve; the per-route limits on sign-in, bidding, checkout and the rest are unchanged.
+        if (HttpMethods.IsGet(context.Request.Method)
+            && (context.Request.Path.StartsWithSegments("/api/catalog", StringComparison.OrdinalIgnoreCase)
+                || context.Request.Path.StartsWithSegments("/api/sellers", StringComparison.OrdinalIgnoreCase)))
+        {
+            return RateLimitPartition.GetTokenBucketLimiter(
+                "catalog:" + (context.Connection.RemoteIpAddress?.ToString() ?? "unknown"),
+                _ => new TokenBucketRateLimiterOptions
+                {
+                    TokenLimit = 600,
+                    TokensPerPeriod = 300,
+                    ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                    QueueLimit = 0,
+                    AutoReplenishment = true,
+                });
+        }
+
         var partitionKey = context.User.FindFirst("sub")?.Value
             ?? context.Connection.RemoteIpAddress?.ToString()
             ?? "unknown";
@@ -202,6 +222,116 @@ builder.Services.AddRateLimiter(options =>
                 AutoReplenishment = true,
             }));
 
+    // Starting a checkout: a burst of 10 covers a buyer trying a few items in a row, then 10 per ten
+    // minutes. Per user, since the endpoints are never anonymous.
+    options.AddPolicy(RateLimitPolicies.Checkout, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 10,
+                TokensPerPeriod = 10,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(10),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Asking for a verification code (SMS or email): 3 to start, then 3 per 10 minutes. Per user.
+    options.AddPolicy(RateLimitPolicies.VerificationCode, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 3,
+                TokensPerPeriod = 3,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(10),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Changing your own password: the caller is signed in, so the thing to bound is guesses at
+    // the current password by someone holding a stolen access token. Per user; five to start,
+    // then two a minute — a person who mistyped needs three tries, a guesser needs thousands.
+    options.AddPolicy(RateLimitPolicies.PasswordChange, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 5,
+                TokensPerPeriod = 2,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Sending chat messages: a burst of ten covers a quick back-and-forth, then ten a minute.
+    // Keyed on the user, since the endpoint is never anonymous.
+    options.AddPolicy(RateLimitPolicies.Messaging, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 10,
+                TokensPerPeriod = 10,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Hearts: a burst of 30 covers ticking through a results page, then 30 a minute.
+    options.AddPolicy(RateLimitPolicies.Watchlist, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 30,
+                TokensPerPeriod = 30,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Writing a review: a burst of five covers a buyer catching up on several delivered orders,
+    // then five per ten minutes. Keyed on the user, since the endpoint is never anonymous.
+    options.AddPolicy(RateLimitPolicies.Reviews, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 5,
+                TokensPerPeriod = 5,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(10),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Connect tickets: a burst of 20 covers several tabs reconnecting together, then 20 a minute.
+    options.AddPolicy(RateLimitPolicies.Realtime, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.User.FindFirst("sub")?.Value ?? "anonymous",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 20,
+                TokensPerPeriod = 20,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
+    // Search suggestions are anonymous, so they are keyed on the caller's address: a burst of 60
+    // covers a person typing a few searches in a row, then 60 a minute.
+    options.AddPolicy(RateLimitPolicies.Suggest, context =>
+        RateLimitPartition.GetTokenBucketLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 60,
+                TokensPerPeriod = 60,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true,
+            }));
+
     // Bidding gets its own tighter budget. It is the most abusable write in the product
     // and the most expensive to serve under contention.
     options.AddPolicy(RateLimitPolicies.Bidding, context =>
@@ -223,10 +353,19 @@ builder.Services.AddScoped<ICurrentUser, CurrentUser>();
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(settings);
 
-// In-process only — see AuctionEventHub's own remarks on what a multi-instance
-// deployment would need instead.
-builder.Services.AddSingleton<AuctionEventHub>();
-builder.Services.AddSingleton<IAuctionEventPublisher>(provider => provider.GetRequiredService<AuctionEventHub>());
+// ─── Simulators ──────────────────────────────────────────────────────────────────
+// Until the payment gateway, a courier provider and the payout provider are connected, an order is walked through
+// payment, shipping and payout by hand from the simulator page. Everything else is the real code. Off unless
+// Koleksi:Simulators:Enabled is set, and KoleksiOptions.Validate has already refused it outside a developer's
+// machine or the dev stage, so this never runs where real money moves.
+var simulators = settings.Simulators.Enabled;
+if (simulators)
+{
+    builder.Services.RemoveAll<IDeliveryTracker>();
+    builder.Services.AddSingleton<IDeliveryTracker, LocalDeliveryTracker>();
+    builder.Services.RemoveAll<IEscrowPayout>();
+    builder.Services.AddSingleton<IEscrowPayout, LocalEscrowPayout>();
+}
 
 #if DEBUG
 // ─── Local identity ─────────────────────────────────────────────────────────────
@@ -245,6 +384,19 @@ if (localIdentity)
 // correctly false — when the endpoint mapping near the bottom of this file asks whether
 // to map LocalMediaEndpoints in a non-Development environment.
 var localMedia = false;
+
+// ─── Local live updates ──────────────────────────────────────────────────────────
+// With no WebSocket API to push through (Koleksi:Realtime:ManagementUrl unset), a developer's
+// run holds the sockets itself, in this process — the same protocol, so the frontend's client
+// is exercised unchanged. A deployed stage, and a Release build, never take this branch.
+var localRealtime = builder.Environment.IsDevelopment()
+    && string.IsNullOrWhiteSpace(settings.Realtime.ManagementUrl);
+if (localRealtime)
+{
+    builder.Services.RemoveAll<IRealtimeBroadcaster>();
+    builder.Services.AddSingleton<LocalRealtimeHub>();
+    builder.Services.AddSingleton<IRealtimeBroadcaster>(provider => provider.GetRequiredService<LocalRealtimeHub>());
+}
 
 // ─── Local phone verification ────────────────────────────────────────────────────
 // Independent of the Cognito placeholder check above: SNS needs no pool id to be
@@ -266,7 +418,14 @@ if (builder.Environment.IsDevelopment())
     // presigned PUTs, real signature verification, just against MinIO instead of AWS — so
     // it is left in place unchanged. Only a developer who has not started MinIO falls back
     // to this in-memory stand-in.
-    localMedia = string.IsNullOrWhiteSpace(settings.Media.ServiceUrl);
+    //
+    // KOLEKSI_FORCE_REAL_MEDIA=true skips that fallback even with ServiceUrl blank, for a
+    // developer who wants real S3 (the actual CDK-provisioned buckets) while still getting
+    // the Development-only conveniences above (fake identity, no SMS/SES). BuildS3Client
+    // resolves real AWS credentials in exactly that case — an empty ServiceUrl is what
+    // selects the real credential chain there, the same as it does for Koleksi:Dynamo.
+    localMedia = string.IsNullOrWhiteSpace(settings.Media.ServiceUrl)
+        && Environment.GetEnvironmentVariable("KOLEKSI_FORCE_REAL_MEDIA") != "true";
     if (localMedia)
     {
         builder.Services.RemoveAll<IMediaStorage>();
@@ -321,11 +480,32 @@ app.UseForwardedHeaders(new ForwardedHeadersOptions
     ForwardedForHeaderName = "X-Forwarded-For",
 });
 
+// The web tier reaches this API through the same gateway, so every visitor would otherwise
+// share its egress address (and the address-keyed rate-limit buckets). When a shared secret is
+// configured, a request that proves it came from the web tier may name the visitor's address.
+// After UseForwardedHeaders so it has the final say, before the limiter so the limiter sees it.
+// Off entirely when no secret is set: the header is then never read.
+if (settings.Security.HasInternalSecret)
+{
+    app.UseMiddleware<TrustedClientIpMiddleware>(settings.Security.InternalSecret!);
+}
+
 app.UseExceptionHandler();
 app.UseSecurityHeaders();
 app.UseCors(CorsPolicies.Frontend);
+
+#if DEBUG
+if (localRealtime)
+{
+    app.UseWebSockets();
+}
+#endif
+
 app.UseAuthentication();
 app.UseAuthorization();
+
+// A banned account cannot start anything new (it can still read, sign out and finish paid orders).
+app.UseMiddleware<BannedAccountMiddleware>();
 app.UseRateLimiter();
 app.UseOutputCache();
 
@@ -340,17 +520,49 @@ if (app.Environment.IsDevelopment())
 app.MapHealthChecks("/health").AllowAnonymous();
 
 app.MapAuthEndpoints();
+app.MapPasswordEndpoints();
 app.MapCatalogEndpoints();
 app.MapAuctionEndpoints();
 app.MapProfileEndpoints();
 app.MapMediaEndpoints();
 app.MapListingEndpoints();
 app.MapOfferEndpoints();
+app.MapConversationEndpoints();
+app.MapRealtimeEndpoints();
 app.MapOrderEndpoints();
 app.MapCartEndpoints();
+app.MapPayoutEndpoints();
+app.MapSellerEndpoints();
+app.MapReviewEndpoints();
+app.MapWatchlistEndpoints();
 app.MapPaymentEndpoints();
+app.MapShippingWebhookEndpoints();
+app.MapInternalEndpoints();
+
+// A laptop has no payment gateway to send a signed webhook, so development gets a route that marks an order
+// paid. Compiled out of every Release build, so it does not exist in a deployed stage whatever its environment says.
+#if DEBUG
+if (app.Environment.IsDevelopment())
+{
+    app.MapDevelopmentPaymentEndpoint();
+}
+#endif
+
+if (simulators)
+{
+    app.MapSimulatorEndpoints();
+}
 
 #if DEBUG
+if (localRealtime)
+{
+    // The WebSocket door the browser connects to when this process is the hub. Anonymous on
+    // purpose, like the deployed API Gateway route: a connection alone grants nothing, and
+    // a user's private channel is joined only by redeeming a ticket.
+    app.Map("/realtime", (HttpContext context, LocalRealtimeHub hub) => hub.HandleAsync(context))
+        .AllowAnonymous();
+}
+
 if (localMedia)
 {
     // Only mapped when LocalMediaStorage replaced the S3 adapter above — these routes

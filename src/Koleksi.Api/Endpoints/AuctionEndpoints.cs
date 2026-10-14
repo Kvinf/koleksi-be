@@ -1,7 +1,5 @@
-using Koleksi.Api.Realtime;
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Auctions;
-using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.RateLimiting;
 
 namespace Koleksi.Api.Endpoints;
@@ -40,23 +38,12 @@ internal static class AuctionEndpoints
             .RequireRateLimiting(RateLimitPolicies.Bidding)
             .WithName("Buyout");
 
-        // Public and anonymous, like every other read on the item page — an SSE connection
-        // cannot carry a bearer token (EventSource sets no custom headers), and there is
-        // nothing here a logged-out visitor could not already see by refreshing the page.
-        group.MapGet("/{listingId}/events", StreamEventsAsync)
-            .WithName("AuctionEvents")
-            .AllowAnonymous();
+        // Live price updates are not served from here. Every accepted bid or buyout is pushed on
+        // the listing's public "auction:" topic over the WebSocket connection — see
+        // RealtimeAuctionEventPublisher.
 
         return app;
     }
-
-    /// <summary>
-    /// One event per accepted bid or buyout on this listing, for as long as the caller's
-    /// connection stays open.
-    /// </summary>
-    private static ServerSentEventsResult<AuctionPriceUpdate> StreamEventsAsync(
-        string listingId, AuctionEventHub hub, CancellationToken ct) =>
-        TypedResults.ServerSentEvents(hub.SubscribeAsync(listingId, ct), eventType: "price");
 
     private static async Task<IResult> PlaceBidAsync(
         string listingId,
@@ -101,9 +88,23 @@ internal static class AuctionEndpoints
     /// </remarks>
     private sealed record PlaceBidRequest(long AmountRupiah);
 
-    private static async Task<IResult> BuyoutAsync(string listingId, BuyoutHandler handler, CancellationToken ct)
+    private static async Task<IResult> BuyoutAsync(
+        string listingId,
+        BuyoutHandler handler,
+        ICurrentUser user,
+        IIdempotencyStore idempotency,
+        HttpRequest http,
+        CancellationToken ct)
     {
-        var result = await handler.HandleAsync(listingId, ct).ConfigureAwait(false);
+        // A double-tap on "Buy now" replays the first answer instead of failing the second tap
+        // with a confusing "auction is closed". No key, no protection.
+        var result = await idempotency.RunOnceAsync(
+            $"auction.buyout:{user.RequireUserId()}:{listingId}",
+            IdempotencyHeader.Read(http),
+            TimeSpan.FromMinutes(10),
+            () => handler.HandleAsync(listingId, ct),
+            ct,
+            inFlight: InFlightPolicy.Reject).ConfigureAwait(false);
 
         return result.Found
             ? Results.Ok(new { result.FinalPriceRupiah })

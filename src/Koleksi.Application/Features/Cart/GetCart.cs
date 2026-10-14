@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Catalog;
 
 namespace Koleksi.Application.Features.Cart;
@@ -18,7 +19,9 @@ public sealed class GetCartHandler(
     IListingRepository listings,
     ICategoryRepository categories,
     IMediaStorage media,
-    ICurrentUser currentUser)
+    IListingHoldStore holds,
+    ICurrentUser currentUser,
+    PublicIdentityResolver identities)
 {
     public async Task<CartView> HandleAsync(CancellationToken ct)
     {
@@ -36,7 +39,11 @@ public sealed class GetCartHandler(
             }
 
             var category = await categories.FindByIdAsync(listing.CategoryId, ct).ConfigureAwait(false);
-            var sellerUsername = await listings.FindSellerUsernameAsync(listing.Id, ct).ConfigureAwait(false);
+            var shopHandle = (await identities.ResolveAsync(listing.SellerId, ct).ConfigureAwait(false)).Handle;
+
+            // Units a buyer could reserve right now, so the cart can say "only 2 left" or "being paid by
+            // someone else" before the buyer presses checkout. The buyer's own unpaid hold counts as taken.
+            var availability = await holds.GetAvailabilityAsync(listing.Id, listing.Stock, ct).ConfigureAwait(false);
 
             rows.Add(new CartRowView(
                 listing.Id,
@@ -44,11 +51,14 @@ public sealed class GetCartHandler(
                 category?.Slug,
                 listing.Price.Rupiah,
                 listing.Condition,
-                listing.SellerId,
-                sellerUsername,
+                shopHandle,
+                shopHandle,
                 listing.City,
-                listing.Photos.Count > 0 ? media.PublicUrl(listing.Photos[0].StorageKey) : null,
-                entry.AddedAt));
+                listing.Photos.Count > 0 ? media.PublicUrl(listing.Photos[0].StorageKey, PhotoSize.Small) : null,
+                entry.AddedAt,
+                Quantity: Math.Min(entry.Quantity, listing.Stock),
+                Stock: listing.Stock,
+                Available: availability.Available));
         }
 
         return new CartView(rows);
@@ -56,12 +66,10 @@ public sealed class GetCartHandler(
 }
 
 /// <param name="CategorySlug"><c>null</c> only if the category was since removed — the listing itself still exists.</param>
+/// <param name="ShopHandle">The seller's public handle: the key a checkout names a shop by. The account id is never exposed.</param>
 /// <param name="SellerUsername">
-/// <c>null</c> when the listing was never indexed into browse — see
-/// <c>IListingRepository.FindSellerUsernameAsync</c>. Cannot actually happen for a row that
-/// just passed the <c>Active</c> check above, since publishing is what indexes a listing,
-/// but the type stays honest about it rather than asserting a guarantee this handler does
-/// not itself enforce.
+/// The seller's public handle (the field keeps its name for the frontend). Never the sign-in
+/// name, which for an email account is the email address.
 /// </param>
 public sealed record CartRowView(
     string ListingId,
@@ -69,10 +77,13 @@ public sealed record CartRowView(
     string? CategorySlug,
     long PriceRupiah,
     string Condition,
-    string SellerId,
+    string ShopHandle,
     string? SellerUsername,
     string SellerCity,
     string? PhotoUrl,
-    DateTimeOffset AddedAt);
+    DateTimeOffset AddedAt,
+    int Quantity = 1,
+    int Stock = 1,
+    int Available = 1);
 
 public sealed record CartView(IReadOnlyList<CartRowView> Items);

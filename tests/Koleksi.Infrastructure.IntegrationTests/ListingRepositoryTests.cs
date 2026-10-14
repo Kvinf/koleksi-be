@@ -181,6 +181,64 @@ public sealed class ListingRepositoryTests : DynamoTestBase
     }
 
     [DynamoLocalFact]
+    public async Task A_sellers_dashboard_survives_other_kinds_of_rows_in_the_shared_seller_index()
+    {
+        // The seller index holds listings, received offers, orders and conversations under one
+        // partition, told apart only by sort-key prefix. With no status filter the query read
+        // all of them and mapped each as a listing, so the first offer or message a seller
+        // received made ToDomain throw ("missing categoryId") and took their dashboard down.
+        var listing = Fixtures.ActiveListing(
+            "Kartu Pokemon Pikachu Illustrator Replika Tidak Resmi",
+            format: ListingFormat.AcceptOffers);
+        await Table.Listings.AddAsync(listing, Ct);
+
+        await Table.Offers.AddAsync(Fixtures.PendingOffer(listing), Ct);
+
+        var conversation = Koleksi.Domain.Messaging.Conversation.Start(
+            listing.Id, listing.Title, null, Fixtures.BidderId, "rangga.wh", Fixtures.SellerId, "budi", Fixtures.Clock);
+        var message = Koleksi.Domain.Messaging.ChatMessage.Create(
+            conversation.Id, Fixtures.BidderId, "Masih ada kak?", Fixtures.Clock);
+        conversation.RecordMessage(message);
+        await Table.Conversations.AppendAsync(conversation, message, Ct);
+
+        var page = await Table.Listings.ListBySellerAsync(
+            Fixtures.SellerId, status: null, cursor: null, limit: 20, Ct);
+
+        page.Items.Select(item => item.Id).ShouldContain(listing.Id);
+        page.Items.ShouldAllBe(item => item.SellerId == Fixtures.SellerId);
+    }
+
+    [DynamoLocalFact]
+    public async Task A_page_is_filled_even_when_other_rows_sit_between_the_listings()
+    {
+        // A filter runs after Limit, so one query can come back short while more listings lie
+        // ahead. The page must keep reading until it is full, and its cursor must resume exactly
+        // where it stopped.
+        var listings = new List<Listing>();
+        for (var i = 0; i < 4; i++)
+        {
+            var listing = Fixtures.ActiveListing($"Kartu Koleksi Seri Campuran Nomor {i} Edisi Khusus");
+            await Table.Listings.AddAsync(listing, Ct);
+            listings.Add(listing);
+
+            var conversation = Koleksi.Domain.Messaging.Conversation.Start(
+                listing.Id, listing.Title, null, $"buyer-{i}", $"buyer.{i}", Fixtures.SellerId, "budi", Fixtures.Clock);
+            var message = Koleksi.Domain.Messaging.ChatMessage.Create(
+                conversation.Id, $"buyer-{i}", "halo", Fixtures.Clock);
+            conversation.RecordMessage(message);
+            await Table.Conversations.AppendAsync(conversation, message, Ct);
+        }
+
+        var first = await Table.Listings.ListBySellerAsync(Fixtures.SellerId, null, null, limit: 2, Ct);
+        first.Items.Count.ShouldBe(2);
+
+        var second = await Table.Listings.ListBySellerAsync(Fixtures.SellerId, null, first.NextCursor, limit: 2, Ct);
+        second.Items.Count.ShouldBeGreaterThanOrEqualTo(1);
+        second.Items.Select(item => item.Id).ShouldNotContain(first.Items[0].Id);
+        second.Items.Select(item => item.Id).ShouldNotContain(first.Items[1].Id);
+    }
+
+    [DynamoLocalFact]
     public async Task A_cursor_from_one_page_starts_the_next_one_where_it_left_off()
     {
         // The cursor is the one value in the system that is encoded here and decoded from

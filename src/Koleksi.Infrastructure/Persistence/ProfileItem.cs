@@ -19,6 +19,7 @@ internal static class ProfileItem
     private const string PhoneVerifiedAttr = "phoneVerified";
     private const string AvatarKeyAttr = "avatarKey";
     private const string IdVerificationStatusAttr = "idVerificationStatus";
+    private const string IdDocumentKeyAttr = "idDocumentKey";
     private const string BankNameAttr = "bankName";
     private const string BankAccountNumberAttr = "bankAccountNumber";
     private const string BankAccountHolderAttr = "bankAccountHolder";
@@ -33,6 +34,7 @@ internal static class ProfileItem
     private const string AddrPhoneAttr = "phone";
     private const string AddrLineAttr = "line";
     private const string AddrCityAttr = "city";
+    private const string AddrProvinceAttr = "province";
     private const string AddrPostalAttr = "postal";
     private const string AddrDefaultAttr = "isDefault";
 
@@ -52,6 +54,7 @@ internal static class ProfileItem
                 [AddrPhoneAttr] = Attr.S(address.Phone),
                 [AddrLineAttr] = Attr.S(address.Line),
                 [AddrCityAttr] = Attr.S(address.City),
+                [AddrProvinceAttr] = Attr.SOrNull(address.Province),
                 [AddrPostalAttr] = Attr.S(address.PostalCode),
                 [AddrDefaultAttr] = Attr.Bool(address.IsDefault),
             }));
@@ -71,6 +74,7 @@ internal static class ProfileItem
             [PhoneVerifiedAttr] = Attr.Bool(profile.PhoneVerified),
             [AvatarKeyAttr] = Attr.SOrNull(profile.AvatarKey),
             [IdVerificationStatusAttr] = Attr.EnumValue(profile.IdVerificationStatus),
+            [IdDocumentKeyAttr] = Attr.SOrNull(profile.IdDocumentKey),
             [BankNameAttr] = Attr.SOrNull(bank?.BankName),
             [BankAccountNumberAttr] = Attr.SOrNull(bank?.AccountNumber),
             [BankAccountHolderAttr] = Attr.SOrNull(bank?.AccountHolderName),
@@ -98,6 +102,9 @@ internal static class ProfileItem
                 map.GetString(AddrPhoneAttr),
                 map.GetString(AddrLineAttr),
                 map.GetString(AddrCityAttr),
+
+                // Absent on rows written before provinces existed.
+                map.GetStringOrNull(AddrProvinceAttr),
                 map.GetString(AddrPostalAttr),
                 map.GetBool(AddrDefaultAttr)));
         }
@@ -121,6 +128,7 @@ internal static class ProfileItem
             addresses: addresses,
             createdAt: item.GetInstant(CreatedAtAttr),
             updatedAt: item.GetInstant(UpdatedAtAttr),
-            version: item.GetLongOrDefault(VersionAttr));
+            version: item.GetLongOrDefault(VersionAttr),
+            idDocumentKey: item.GetStringOrNull(IdDocumentKeyAttr));
     }
 }

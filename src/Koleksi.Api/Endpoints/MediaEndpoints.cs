@@ -21,9 +21,59 @@ internal static class MediaEndpoints
         var group = app.MapGroup("/api/media").WithTags("Media");
 
         group.MapPost("/upload-grant", CreateUploadGrantAsync).WithName("CreateUploadGrant");
+        group.MapPost("/photo-upload-grants", CreatePhotoUploadGrantsAsync).WithName("CreatePhotoUploadGrants");
 
         return app;
     }
+
+    /// <summary>
+    /// Grants a listing photo's three uploads (original, large, small) in one call — see
+    /// <see cref="IMediaStorage.CreatePhotoUploadGrantSetAsync"/>. The only media purpose
+    /// this covers; avatars, review photos, shipping proof, and identity documents stay on
+    /// the single-grant endpoint above, since none of them render at more than one size.
+    /// </summary>
+    private static async Task<IResult> CreatePhotoUploadGrantsAsync(
+        PhotoUploadGrantsRequest request, ICurrentUser user, IMediaStorage media, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (string.IsNullOrWhiteSpace(request.OriginalContentType)
+            || request.OriginalContentLength <= 0
+            || request.LargeContentLength <= 0
+            || request.SmallContentLength <= 0)
+        {
+            return Results.BadRequest(new { code = "media.invalid_request" });
+        }
+
+        var grants = await media.CreatePhotoUploadGrantSetAsync(
+            user.RequireUserId(),
+            new PhotoUploadSpec(request.OriginalContentType, request.OriginalContentLength),
+
+            // The two derivatives are always re-encoded as JPEG client-side — see
+            // directUpload.ts — so their content type is not part of the request at all.
+            new PhotoUploadSpec("image/jpeg", request.LargeContentLength),
+            new PhotoUploadSpec("image/jpeg", request.SmallContentLength),
+            ct).ConfigureAwait(false);
+
+        static object ToResponse(UploadGrant grant) => new
+        {
+            grant.StorageKey,
+            UploadUrl = grant.UploadUrl.ToString(),
+            grant.RequiredHeaders,
+        };
+
+        return Results.Ok(new
+        {
+            grants.StorageKey,
+            Original = ToResponse(grants.Original),
+            Large = ToResponse(grants.Large),
+            Small = ToResponse(grants.Small),
+            grants.Original.ExpiresAt,
+        });
+    }
+
+    private sealed record PhotoUploadGrantsRequest(
+        string OriginalContentType, long OriginalContentLength, long LargeContentLength, long SmallContentLength);
 
     private static async Task<IResult> CreateUploadGrantAsync(
         UploadGrantRequest request, ICurrentUser user, IMediaStorage media, CancellationToken ct)

@@ -54,44 +54,129 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
                 $"Photos must be under {IMediaStorage.MaxUploadBytes / (1024 * 1024)} MB.");
         }
 
-        var key = BuildKey(purpose, ownerId, contentType);
-        var expiresAt = DateTimeOffset.UtcNow.AddMinutes(15);
+        var key = BuildKey(purpose, ownerId, ExtensionFor(contentType));
 
-        return Task.FromResult(new UploadGrant(
-            StorageKey: key,
-            UploadUrl: new Uri($"{BaseUrl()}/api/media/local-object/{key}"),
-            RequiredHeaders: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Content-Type"] = contentType,
-            },
-            ExpiresAt: expiresAt));
+        return Task.FromResult(SignGrant(key, contentType));
     }
+
+    public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
+        ArgumentNullException.ThrowIfNull(original);
+        ArgumentNullException.ThrowIfNull(large);
+        ArgumentNullException.ThrowIfNull(small);
+
+        // Same rules as S3MediaStorage.CreatePhotoUploadGrantSetAsync — see its remarks.
+        ValidateImageUpload(original.ContentType, original.ContentLength);
+        if (large.ContentType != "image/jpeg" || small.ContentType != "image/jpeg")
+        {
+            throw DomainException.For("media.unsupported_type", "Resized photo derivatives must be JPEG.");
+        }
+        ValidateUploadSize(large.ContentLength);
+        ValidateUploadSize(small.ContentLength);
+
+        var key = BuildKey(MediaPurpose.ListingPhoto, ownerId, extension: string.Empty);
+
+        return Task.FromResult(new PhotoUploadGrantSet(
+            StorageKey: key,
+            Original: SignGrant($"{key}/original", original.ContentType),
+            Large: SignGrant($"{key}/large", large.ContentType),
+            Small: SignGrant($"{key}/small", small.ContentType)));
+    }
+
+    private static void ValidateImageUpload(string contentType, long contentLength)
+    {
+        if (!IMediaStorage.PermittedImageTypes.Contains(contentType))
+        {
+            throw DomainException.For(
+                "media.unsupported_type",
+                "Photos must be JPEG, PNG, WebP, or AVIF.");
+        }
+
+        ValidateUploadSize(contentLength);
+    }
+
+    private static void ValidateUploadSize(long contentLength)
+    {
+        if (contentLength <= 0 || contentLength > IMediaStorage.MaxUploadBytes)
+        {
+            throw DomainException.For(
+                "media.too_large",
+                $"Photos must be under {IMediaStorage.MaxUploadBytes / (1024 * 1024)} MB.");
+        }
+    }
+
+    private UploadGrant SignGrant(string key, string contentType) => new(
+        StorageKey: key,
+        UploadUrl: new Uri($"{BaseUrl()}/api/media/local-object/{key}"),
+        RequiredHeaders: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Content-Type"] = contentType,
+        },
+        ExpiresAt: DateTimeOffset.UtcNow.AddMinutes(15));
 
     public Task<bool> VerifyUploadedAsync(string storageKey, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
 
-        var verified = objects.TryGetValue(storageKey, out var stored)
-            && stored.Bytes.Length > 0
-            && stored.Bytes.Length <= IMediaStorage.MaxUploadBytes
-            && IMediaStorage.PermittedImageTypes.Contains(stored.ContentType);
+        return Task.FromResult(ObjectLooksUploaded(storageKey));
+    }
+
+    public Task<bool> VerifyPhotoUploadedAsync(string storageKey, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
+
+        if (PurposeFromKey(storageKey) != MediaPurpose.ListingPhoto)
+        {
+            return Task.FromResult(false);
+        }
+
+        if (MediaKeys.IsLegacyListingPhotoKey(storageKey))
+        {
+            return Task.FromResult(ObjectLooksUploaded(storageKey));
+        }
+
+        var verified = ObjectLooksUploaded($"{storageKey}/original")
+            && ObjectLooksUploaded($"{storageKey}/large")
+            && ObjectLooksUploaded($"{storageKey}/small");
 
         return Task.FromResult(verified);
     }
 
-    public string PublicUrl(string storageKey)
+    private bool ObjectLooksUploaded(string key) =>
+        objects.TryGetValue(key, out var stored)
+        && stored.Bytes.Length > 0
+        && stored.Bytes.Length <= IMediaStorage.MaxUploadBytes
+        && IMediaStorage.PermittedImageTypes.Contains(stored.ContentType);
+
+    public string PublicUrl(string storageKey, PhotoSize size = PhotoSize.Original)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
 
+        var purpose = PurposeFromKey(storageKey);
+
         // Same refusal as S3MediaStorage: identity documents have no public URL, here or
         // in a deployed stage.
-        if (PurposeFromKey(storageKey) == MediaPurpose.IdentityDocument)
+        if (purpose == MediaPurpose.IdentityDocument)
         {
             throw new InvalidOperationException("Identity documents are never served publicly.");
         }
 
-        return $"{BaseUrl()}/api/media/local-object/{storageKey}";
+        var key = purpose == MediaPurpose.ListingPhoto && !MediaKeys.IsLegacyListingPhotoKey(storageKey)
+            ? $"{storageKey}/{SizeSegment(size)}"
+            : storageKey;
+
+        return $"{BaseUrl()}/api/media/local-object/{key}";
     }
+
+    private static string SizeSegment(PhotoSize size) => size switch
+    {
+        PhotoSize.Original => "original",
+        PhotoSize.Large => "large",
+        PhotoSize.Small => "small",
+        _ => throw new ArgumentOutOfRangeException(nameof(size)),
+    };
 
     /// <summary>Records the bytes a PUT to <c>/api/media/local-object/{key}</c> actually sent.</summary>
     internal void Store(string storageKey, string contentType, byte[] bytes) =>
@@ -115,8 +200,11 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
         return $"{request.Scheme}://{request.Host}";
     }
 
-    /// <summary>Mirrors <c>S3MediaStorage.BuildKey</c> — same prefixes, same shape.</summary>
-    private static string BuildKey(MediaPurpose purpose, string ownerId, string contentType)
+    /// <summary>
+    /// Mirrors <c>S3MediaStorage.BuildKeyWithExtension</c> — same prefixes, same shape.
+    /// Empty <paramref name="extension"/> for a listing photo's shared base key.
+    /// </summary>
+    private static string BuildKey(MediaPurpose purpose, string ownerId, string extension)
     {
         var prefix = purpose switch
         {
@@ -130,7 +218,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
 
         var owner = EntityId.IsValid(ownerId) ? EntityId.Normalise(ownerId) : Sanitise(ownerId);
 
-        return $"{prefix}/{owner}/{EntityId.New()}{ExtensionFor(contentType)}";
+        return $"{prefix}/{owner}/{EntityId.New()}{extension}";
     }
 
     private static MediaPurpose? PurposeFromKey(string storageKey) =>

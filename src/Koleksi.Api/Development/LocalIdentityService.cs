@@ -27,8 +27,8 @@ internal sealed partial class LocalIdentityService(
     LocalAccountStore accountStore,
     ILogger<LocalIdentityService> logger) : IIdentityService
 {
-    /// <summary>Matches the access-token lifetime a Cognito pool issues by default.</summary>
-    private static readonly TimeSpan AccessTokenLifetime = TimeSpan.FromHours(1);
+    /// <summary>Matches <c>accessTokenValidity</c> on the web client in <c>auth-stack.ts</c>; change both.</summary>
+    private static readonly TimeSpan AccessTokenLifetime = TimeSpan.FromMinutes(15);
 
     private static readonly JsonWebTokenHandler Handler = new();
 
@@ -45,6 +45,16 @@ internal sealed partial class LocalIdentityService(
         new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly TimeSpan OtpLifetime = TimeSpan.FromMinutes(5);
+
+    /// <summary>Live password-reset codes, keyed by email — one per address, a new request replaces it.</summary>
+    private readonly ConcurrentDictionary<string, ResetState> passwordResets =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Shorter than the pool's own hour: a developer is looking at the screen, not an inbox.</summary>
+    private static readonly TimeSpan PasswordResetLifetime = TimeSpan.FromMinutes(10);
+
+    /// <summary>Wrong guesses a reset code survives; the pool enforces a limit of the same kind.</summary>
+    private const int PasswordResetMaxAttempts = 5;
 
     /// <summary>
     /// How long a sign-up confirmation code stays usable. Longer than <see cref="OtpLifetime"/>
@@ -104,6 +114,17 @@ internal sealed partial class LocalIdentityService(
         if (await accountStore.FindByUsernameAsync(handle, ct).ConfigureAwait(false) is not null)
         {
             return RegistrationOutcome.Failed("auth.username_taken");
+        }
+
+        // An address that already has a confirmed account: no second one. The pool does the same through its
+        // pre-sign-up trigger. An unconfirmed one never proved the address, so it does not block.
+        var holder = await accountStore.FindByEmailAsync(email.Trim(), ct).ConfigureAwait(false);
+        if (holder is { Confirmed: true })
+        {
+            return RegistrationOutcome.EmailRegistered(
+                string.Equals(holder.Email, GoogleDevEmail, StringComparison.OrdinalIgnoreCase)
+                    ? EmailAccount.Google
+                    : EmailAccount.Password);
         }
 
         var account = new LocalAccount(EntityId.New(), handle, email.Trim(), password, Confirmed: false);
@@ -358,6 +379,155 @@ internal sealed partial class LocalIdentityService(
         return account?.Email;
     }
 
+    /// <summary>
+    /// Issues a reset code, returned as <c>DevCode</c> only for an address that has a local
+    /// account with a password — exactly the rule <see cref="RequestEmailOtpAsync"/> follows.
+    /// </summary>
+    /// <remarks>
+    /// The code reaches a response only because this type is compiled out of every Release
+    /// build (<c>#if DEBUG</c>) and is swapped in only for a Development host with placeholder
+    /// pool ids, so a deployed stage can never reveal which addresses are registered this way.
+    /// The unconfirmed and Google dev accounts get nothing, as the pool would give them
+    /// nothing to deliver.
+    /// </remarks>
+    public async Task<string?> RequestPasswordResetAsync(string email, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(email);
+
+        var trimmed = email.Trim();
+        var account = await accountStore.FindByEmailAsync(trimmed, ct).ConfigureAwait(false);
+
+        if (account is null || !account.Confirmed || IsGoogleDevAccount(account))
+        {
+            return null;
+        }
+
+        var code = GenerateCode();
+        passwordResets[trimmed] = new ResetState(code, DateTimeOffset.UtcNow.Add(PasswordResetLifetime));
+        LogPasswordResetIssued(logger, trimmed, code);
+
+        return code;
+    }
+
+    public async Task<PasswordOutcome> ConfirmPasswordResetAsync(
+        string email, string code, string newPassword, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(email);
+        ArgumentNullException.ThrowIfNull(code);
+        ArgumentNullException.ThrowIfNull(newPassword);
+
+        // The policy first and without touching the code, so a weak password costs the
+        // reader neither the code nor an attempt — a refused password leaves the code usable.
+        if (!IsPasswordAcceptable(newPassword))
+        {
+            return PasswordOutcome.Failed("auth.password_too_weak");
+        }
+
+        var trimmed = email.Trim();
+
+        // No pending code for this address — never asked, already used, or no such account —
+        // is one answer, the same one a wrong code gets.
+        if (!passwordResets.TryGetValue(trimmed, out var state))
+        {
+            return PasswordOutcome.Failed("auth.code_invalid");
+        }
+
+        if (state.ExpiresAt < DateTimeOffset.UtcNow)
+        {
+            passwordResets.TryRemove(trimmed, out _);
+            return PasswordOutcome.Failed("auth.code_expired");
+        }
+
+        if (!Matches(state.Code, code.Trim()))
+        {
+            // Interlocked because two guesses can race; the dictionary entry is shared.
+            if (Interlocked.Increment(ref state.Attempts) >= PasswordResetMaxAttempts)
+            {
+                passwordResets.TryRemove(trimmed, out _);
+                return PasswordOutcome.Failed("auth.try_again_later");
+            }
+
+            return PasswordOutcome.Failed("auth.code_invalid");
+        }
+
+        // Single use: removed before the write so a replay of the same code cannot win a race.
+        if (!passwordResets.TryRemove(trimmed, out _))
+        {
+            return PasswordOutcome.Failed("auth.code_invalid");
+        }
+
+        var account = await accountStore.FindByEmailAsync(trimmed, ct).ConfigureAwait(false);
+
+        if (account is null)
+        {
+            return PasswordOutcome.Failed("auth.code_invalid");
+        }
+
+        await accountStore.SaveAsync(account with { Password = newPassword }, ct).ConfigureAwait(false);
+
+        // A reset ends the account's existing sessions locally. The Cognito adapter cannot do
+        // this for a reset (it holds no AWS authority), so this is stricter than the deployed
+        // behaviour — noted rather than hidden.
+        RevokeRefreshTokensOf(account.Email);
+
+        return PasswordOutcome.Success;
+    }
+
+    public async Task<PasswordOutcome> ChangePasswordAsync(
+        string accessToken, string currentPassword, string newPassword, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(accessToken);
+        ArgumentNullException.ThrowIfNull(currentPassword);
+        ArgumentNullException.ThrowIfNull(newPassword);
+
+        var account = await FindCallerAsync(accessToken, ct).ConfigureAwait(false);
+
+        if (account is null || IsGoogleDevAccount(account) || !Matches(account.Password, currentPassword))
+        {
+            return PasswordOutcome.Failed("auth.current_password_invalid");
+        }
+
+        if (!IsPasswordAcceptable(newPassword))
+        {
+            return PasswordOutcome.Failed("auth.password_too_weak");
+        }
+
+        await accountStore.SaveAsync(account with { Password = newPassword }, ct).ConfigureAwait(false);
+        RevokeRefreshTokensOf(account.Email);
+
+        return PasswordOutcome.Success;
+    }
+
+    public async Task<bool> CanChangePasswordAsync(string accessToken, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(accessToken);
+
+        var account = await FindCallerAsync(accessToken, ct).ConfigureAwait(false);
+        return account is not null && !IsGoogleDevAccount(account);
+    }
+
+    /// <summary>The account the token's <c>sub</c> names — see <see cref="GetEmailAsync"/> on why no signature check.</summary>
+    private async Task<LocalAccount?> FindCallerAsync(string accessToken, CancellationToken ct)
+    {
+        var subject = Handler.ReadJsonWebToken(accessToken).GetClaim("sub").Value;
+        return await accountStore.FindBySubjectAsync(subject, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>The Google dev account's "password" is a random token nobody knows: it has none to change.</summary>
+    private static bool IsGoogleDevAccount(LocalAccount account) =>
+        string.Equals(account.Email, GoogleDevEmail, StringComparison.OrdinalIgnoreCase);
+
+    private void RevokeRefreshTokensOf(string email)
+    {
+        foreach (var (token, owner) in refreshTokens)
+        {
+            if (string.Equals(owner, email, StringComparison.OrdinalIgnoreCase))
+            {
+                refreshTokens.TryRemove(token, out _);
+            }
+        }
+    }
+
     private static string GenerateCode() =>
         RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6", System.Globalization.CultureInfo.InvariantCulture);
 
@@ -436,6 +606,17 @@ internal sealed partial class LocalIdentityService(
     /// <summary>A sign-up confirmation code awaiting <see cref="ConfirmSignUpAsync"/>.</summary>
     private sealed record ConfirmationState(string Email, string Code, DateTimeOffset ExpiresAt);
 
+    /// <summary>A password-reset code awaiting <see cref="ConfirmPasswordResetAsync"/>.</summary>
+    private sealed class ResetState(string code, DateTimeOffset expiresAt)
+    {
+        public string Code { get; } = code;
+
+        public DateTimeOffset ExpiresAt { get; } = expiresAt;
+
+        /// <summary>A field, not a property: <c>Interlocked.Increment</c> needs a <c>ref</c>.</summary>
+        public int Attempts;
+    }
+
     [LoggerMessage(
         Level = Microsoft.Extensions.Logging.LogLevel.Information,
         Message = "Local account registered: {Username} <{Email}>. It lives until this process exits.")]
@@ -445,6 +626,11 @@ internal sealed partial class LocalIdentityService(
         Level = Microsoft.Extensions.Logging.LogLevel.Information,
         Message = "Local email-OTP issued for {Email}: {Code}. There is no mailbox; this is the only place it appears.")]
     private static partial void LogOtpIssued(ILogger logger, string email, string code);
+
+    [LoggerMessage(
+        Level = Microsoft.Extensions.Logging.LogLevel.Information,
+        Message = "Local password-reset code issued for {Email}: {Code}. There is no mailbox; this is the only place it appears.")]
+    private static partial void LogPasswordResetIssued(ILogger logger, string email, string code);
 
     [LoggerMessage(
         Level = Microsoft.Extensions.Logging.LogLevel.Information,

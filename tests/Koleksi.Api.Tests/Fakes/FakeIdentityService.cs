@@ -131,6 +131,89 @@ public sealed class FakeIdentityService : FakeAdapter, IIdentityService
         return Task.FromResult(NextEmail);
     }
 
+    /// <summary>Address the next <see cref="RequestPasswordResetAsync"/> call "has an account" for.</summary>
+    public const string KnownResetEmail = KnownEmail;
+
+    /// <summary>Code the next <see cref="ConfirmPasswordResetAsync"/> call requires to succeed.</summary>
+    public const string KnownResetCode = "654321";
+
+    /// <summary>Current password <see cref="ChangePasswordAsync"/> requires to succeed.</summary>
+    public const string KnownCurrentPassword = KnownPassword;
+
+    /// <summary>The dev code the next reset request for the known address returns, as the local stub would.</summary>
+    public string? NextResetDevCode { get; set; }
+
+    /// <summary>When set, the next password reset/change fails with this code regardless of input.</summary>
+    public string? NextPasswordFailure { get; set; }
+
+    /// <summary>Whether <see cref="CanChangePasswordAsync"/> answers yes — false models a Google-only account.</summary>
+    public bool NextCanChangePassword { get; set; } = true;
+
+    /// <summary>Addresses <see cref="RequestPasswordResetAsync"/> was called with, in call order — registered or not.</summary>
+    public List<string> ResetRequests { get; } = [];
+
+    /// <summary>Passwords the reset/change calls accepted, in call order.</summary>
+    public List<string> PasswordsSet { get; } = [];
+
+    public Task<string?> RequestPasswordResetAsync(string email, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        ResetRequests.Add(email);
+
+        // Registered or not, the caller sees a completed call; only the dev code differs, and
+        // only the local stub ever returns one.
+        return Task.FromResult(
+            string.Equals(email, KnownResetEmail, StringComparison.OrdinalIgnoreCase) ? NextResetDevCode : null);
+    }
+
+    public Task<PasswordOutcome> ConfirmPasswordResetAsync(
+        string email, string code, string newPassword, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        if (NextPasswordFailure is { } failure)
+        {
+            return Task.FromResult(PasswordOutcome.Failed(failure));
+        }
+
+        // Unknown account and wrong code are the same answer, as the contract requires.
+        var matches = string.Equals(email, KnownResetEmail, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(code, KnownResetCode, StringComparison.Ordinal);
+
+        if (!matches)
+        {
+            return Task.FromResult(PasswordOutcome.Failed("auth.code_invalid"));
+        }
+
+        PasswordsSet.Add(newPassword);
+        return Task.FromResult(PasswordOutcome.Success);
+    }
+
+    public Task<PasswordOutcome> ChangePasswordAsync(
+        string accessToken, string currentPassword, string newPassword, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        if (NextPasswordFailure is { } failure)
+        {
+            return Task.FromResult(PasswordOutcome.Failed(failure));
+        }
+
+        if (!string.Equals(currentPassword, KnownCurrentPassword, StringComparison.Ordinal))
+        {
+            return Task.FromResult(PasswordOutcome.Failed("auth.current_password_invalid"));
+        }
+
+        PasswordsSet.Add(newPassword);
+        return Task.FromResult(PasswordOutcome.Success);
+    }
+
+    public Task<bool> CanChangePasswordAsync(string accessToken, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        return Task.FromResult(NextCanChangePassword);
+    }
+
     private static AuthenticatedSession Session() => new(
         "header.payload.signature",
         "valid-refresh",

@@ -91,17 +91,17 @@ public sealed class BrowseEndpointTests(KoleksiApiFactory factory) : IClassFixtu
     [Fact]
     public async Task A_facet_value_the_caller_invented_never_reaches_storage()
     {
-        // "PSA 11" does not exist. Accepting it would let a seller mint a grade that sorts
+        // "Grade 11" does not exist. Accepting it would let a seller mint a grade that sorts
         // above every honest listing, and would push unvetted text into an index key.
         using var client = factory.CreateClient();
 
         using var response = await client.GetAsync(
-            "/api/catalog/browse?kategori=kartu&f.grade=PSA%2010&f.grade=PSA%2011");
+            "/api/catalog/browse?kategori=kartu&f.grade=Grade%2010&f.grade=Grade%2011");
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
 
         var selected = factory.SearchIndex.LastQuery.ShouldNotBeNull().SelectedFacets;
-        selected["grade"].ShouldHaveSingleItem().ShouldBe("PSA 10");
+        selected["grade"].ShouldHaveSingleItem().ShouldBe("Grade 10");
     }
 
     [Fact]
@@ -110,7 +110,7 @@ public sealed class BrowseEndpointTests(KoleksiApiFactory factory) : IClassFixtu
         using var client = factory.CreateClient();
 
         using var response = await client.GetAsync(
-            "/api/catalog/browse?kategori=kartu&f.internal_flag=true&f.grade=PSA%209");
+            "/api/catalog/browse?kategori=kartu&f.internal_flag=true&f.grade=Grade%209");
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
 
@@ -165,7 +165,7 @@ public sealed class BrowseEndpointTests(KoleksiApiFactory factory) : IClassFixtu
     [Fact]
     public async Task Facet_counts_are_rendered_beside_every_option_in_the_schema()
     {
-        factory.SearchIndex.SeedFacetCount("grade", "PSA 10", 42);
+        factory.SearchIndex.SeedFacetCount("grade", "Grade 10", 42);
         using var client = factory.CreateClient();
 
         using var response = await client.GetAsync("/api/catalog/browse?kategori=kartu");
@@ -182,7 +182,7 @@ public sealed class BrowseEndpointTests(KoleksiApiFactory factory) : IClassFixtu
         // Every option, not only the counted ones: a filter that vanishes when its count
         // reaches zero is a filter a shopper cannot use to get back to where they were.
         options.Count.ShouldBe(4);
-        options.Single(option => option.GetProperty("value").GetString() == "PSA 10")
+        options.Single(option => option.GetProperty("value").GetString() == "Grade 10")
             .GetProperty("count").GetInt64().ShouldBe(42);
     }
 }

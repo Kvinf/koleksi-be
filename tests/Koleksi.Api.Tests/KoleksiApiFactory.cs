@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using Koleksi.Api.Tests.Fakes;
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Standing;
 using Koleksi.Domain.Common;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Hosting;
@@ -37,7 +38,7 @@ namespace Koleksi.Api.Tests;
 /// actually depends on: reads return a fresh aggregate, and writes enforce the version.
 /// </para>
 /// </remarks>
-public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
+public class KoleksiApiFactory : WebApplicationFactory<Program>
 {
     public const string Region = "ap-southeast-3";
     public const string UserPoolId = "ap-southeast-3_koleksitest";
@@ -55,7 +56,19 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
     /// <summary>The one origin the CORS policy permits.</summary>
     public const string AllowedOrigin = "https://koleksi.test";
 
+    /// <summary>The shared secret the web tier would present (X-Koleksi-Internal). At least 32 characters.</summary>
+    public const string InternalSecret = "test-internal-secret-0123456789abcdef";
+
     static KoleksiApiFactory() => ApplyConfigurationEnvironment();
+
+    public KoleksiApiFactory()
+    {
+        Idempotency = new FakeIdempotencyStore(Clock);
+        VerificationThrottle = new FakeVerificationThrottle(Clock);
+        Holds = new FakeListingHoldStore(Clock);
+        PaymentOrphans = new FakePaymentOrphanStore();
+        Watchlist = new FakeWatchlistRepository(Listings);
+    }
 
     /// <summary>The key the API will accept signatures from.</summary>
     public TestSigningKey SigningKey { get; } = new("koleksi-test-key");
@@ -66,9 +79,11 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
 
     public FakeListingSearchIndex SearchIndex { get; } = new();
 
+    public FakeListingSuggestionIndex Suggestions { get; } = new();
+
     public FakeMediaStorage Media { get; } = new();
 
-    public FakeIdempotencyStore Idempotency { get; } = new();
+    public FakeIdempotencyStore Idempotency { get; }
 
     public MutableClock Clock { get; } = new();
 
@@ -76,17 +91,48 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
 
     public FakeProfileRepository Profiles { get; } = new();
 
+    public FakePublicProfileRepository PublicProfiles { get; } = new();
+
+    public FakeReviewRepository Reviews { get; } = new();
+
     public FakePhoneVerificationService PhoneVerification { get; } = new();
 
     public FakeEmailVerificationService EmailVerification { get; } = new();
 
+    public FakeVerificationThrottle VerificationThrottle { get; }
+
     public FakeOfferRepository Offers { get; } = new();
+
+    public FakeConversationRepository Conversations { get; } = new();
 
     public FakeOrderRepository Orders { get; } = new();
 
     public FakeCartRepository Cart { get; } = new();
 
+    public FakeWatchlistRepository Watchlist { get; }
+
     public FakePaymentGateway Payments { get; } = new();
+
+    public FakeRealtimeBroadcaster Realtime { get; } = new();
+
+    public FakeListingHoldStore Holds { get; }
+
+    public FakePaymentOrphanStore PaymentOrphans { get; }
+
+    public FakeOrderSweepBackfill OrderSweepBackfill { get; } = new();
+
+    /// <summary>The payouts owed to sellers; shared with <see cref="Orders"/> so a release writes both.</summary>
+    public FakePayoutRepository Payouts => Orders.Payouts;
+
+    public FakeAccountStandingRepository Standings { get; } = new();
+
+    public FakeDeliveryTracker Courier { get; } = new();
+
+    public FakeDeliveryWebhookProvider DeliveryWebhook { get; } = new();
+
+    public FakeEscrowPayout PayoutProvider { get; } = new();
+
+    public FakeRealtimeTicketStore RealtimeTickets { get; } = new();
 
     /// <summary>
     /// A client that appears to come from a particular caller address.
@@ -102,6 +148,17 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
         var client = CreateClient();
         client.DefaultRequestHeaders.Add("X-Forwarded-For", clientAddress);
         return client;
+    }
+
+    /// <summary>
+    /// The public handle an account is shown under, assigning one if it has none yet — what every
+    /// public response now carries in place of the sign-in name.
+    /// </summary>
+    public string PublicHandleOf(string userId)
+    {
+        using var scope = Services.CreateScope();
+        var resolver = scope.ServiceProvider.GetRequiredService<Koleksi.Application.Features.Sellers.PublicIdentityResolver>();
+        return resolver.ResolveAsync(userId, CancellationToken.None).GetAwaiter().GetResult().Handle;
     }
 
     /// <summary>A client that presents the given access token on every request.</summary>
@@ -165,6 +222,7 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
             "arn:aws:secretsmanager:ap-southeast-3:000000000000:secret:koleksi-test-payment");
         Set("KOLEKSI__PAYMENT__RETURNURL", "https://koleksi.test/checkout/selesai");
         Set("KOLEKSI__CORS__ALLOWEDORIGINS__0", AllowedOrigin);
+        Set("KOLEKSI__SECURITY__INTERNALSECRET", InternalSecret);
 
         static void Set(string key, string value) => Environment.SetEnvironmentVariable(key, value);
     }
@@ -199,6 +257,7 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
         Replace<IListingRepository>(services, Listings);
         Replace<IAuctionRepository>(services, Auctions);
         Replace<IListingSearchIndex>(services, SearchIndex);
+        Replace<IListingSuggestionIndex>(services, Suggestions);
         Replace<IMediaStorage>(services, Media);
         Replace<IIdempotencyStore>(services, Idempotency);
         Replace<IClock>(services, Clock);
@@ -208,12 +267,29 @@ public sealed class KoleksiApiFactory : WebApplicationFactory<Program>
         Replace<IIdentityService>(services, Identity);
 
         Replace<IProfileRepository>(services, Profiles);
+        Replace<IPublicProfileRepository>(services, PublicProfiles);
+        Replace<IReviewRepository>(services, Reviews);
         Replace<IPhoneVerificationService>(services, PhoneVerification);
         Replace<IEmailVerificationService>(services, EmailVerification);
+        Replace<IVerificationThrottle>(services, VerificationThrottle);
 
         Replace<IOfferRepository>(services, Offers);
+        Replace<IConversationRepository>(services, Conversations);
         Replace<IOrderRepository>(services, Orders);
+        Replace<IOrderSweepBackfill>(services, OrderSweepBackfill);
+        Replace<IListingHoldStore>(services, Holds);
+        Replace<IPayoutRepository>(services, Orders.Payouts);
+        Replace<IAccountStandingRepository>(services, Standings);
+        Replace<IDeliveryTracker>(services, Courier);
+        services.AddSingleton<IDeliveryWebhookProvider>(DeliveryWebhook);
+        Replace<IEscrowPayout>(services, PayoutProvider);
+        Replace<IPaymentOrphanStore>(services, PaymentOrphans);
         Replace<ICartRepository>(services, Cart);
+        Replace<IWatchlistRepository>(services, Watchlist);
+
+        // Pushes are recorded rather than sent: there is no WebSocket API behind a test host.
+        Replace<IRealtimeBroadcaster>(services, Realtime);
+        Replace<IRealtimeTicketStore>(services, RealtimeTickets);
 
         // The one AWS dependency of the bunch that is not in InfrastructureServiceCollectionExtensions'
         // usual shape — see FakePaymentGateway's own remarks on why it exists at all.

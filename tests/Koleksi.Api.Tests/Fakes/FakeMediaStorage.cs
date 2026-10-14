@@ -32,13 +32,38 @@ public sealed class FakeMediaStorage : FakeAdapter, IMediaStorage
             DateTimeOffset.UnixEpoch.AddYears(60)));
     }
 
+    public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        var key = $"listings/{ownerId}/test-object";
+        UploadGrant Grant(string suffix, string contentType) => new(
+            $"{key}/{suffix}",
+            new Uri($"{CdnBase}/upload/{key}/{suffix}"),
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["Content-Type"] = contentType },
+            DateTimeOffset.UnixEpoch.AddYears(60));
+
+        return Task.FromResult(new PhotoUploadGrantSet(
+            key,
+            Grant("original", original.ContentType),
+            Grant("large", large.ContentType),
+            Grant("small", small.ContentType)));
+    }
+
     public Task<bool> VerifyUploadedAsync(string storageKey, CancellationToken ct)
     {
         ThrowIfFailing();
         return Task.FromResult(NextVerifyUploadedResult);
     }
 
-    public string PublicUrl(string storageKey)
+    public Task<bool> VerifyPhotoUploadedAsync(string storageKey, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        return Task.FromResult(NextVerifyUploadedResult);
+    }
+
+    public string PublicUrl(string storageKey, PhotoSize size = PhotoSize.Original)
     {
         ThrowIfFailing();
         return $"{CdnBase}/{storageKey}";
