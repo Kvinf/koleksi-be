@@ -34,6 +34,9 @@
   <PropertyGroup>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+    <!-- The API is published for the Lambda arm64 runtime. Declaring the RID here puts it in every lock file, so the locked
+         restore in CI agrees with `dotnet publish -r linux-arm64` instead of failing with NU1004. -->
+    <RuntimeIdentifiers>linux-arm64</RuntimeIdentifiers>
     <NuGetAudit>true</NuGetAudit>
     <NuGetAuditMode>all</NuGetAuditMode>
     <NuGetAuditLevel>low</NuGetAuditLevel>
