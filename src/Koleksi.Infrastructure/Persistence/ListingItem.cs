@@ -30,6 +30,10 @@ internal static class ListingItem
     private const string ViewCountAttr = "viewCount";
     private const string WatcherCountAttr = "watcherCount";
     private const string AutoDeclineAttr = "autoDeclineBelowPercent";
+    private const string AuctionDurationAttr = "auctionDurationDays";
+    private const string AuctionReserveAttr = "auctionReservePrice";
+    private const string AuctionBuyoutAttr = "auctionBuyoutPrice";
+    private const string StockAttr = "stock";
     private const string CreatedAtAttr = "createdAt";
     private const string UpdatedAtAttr = "updatedAt";
     private const string PublishedAtAttr = "publishedAt";
@@ -41,6 +45,12 @@ internal static class ListingItem
 
     /// <summary>The view counter, named here so the atomic-increment update can reference it.</summary>
     public static string ViewCountAttribute => ViewCountAttr;
+
+    /// <summary>The watcher counter, named here so the watchlist's atomic add can reference it.</summary>
+    public static string WatcherCountAttribute => WatcherCountAttr;
+
+    /// <summary>The status, named here so the watchlist can condition a save on the listing being active.</summary>
+    public static string StatusAttribute => StatusAttr;
 
     /// <summary>The concurrency token, named here so the conditional write can reference it.</summary>
     public static string VersionAttribute => VersionAttr;
@@ -79,6 +89,14 @@ internal static class ListingItem
             [AutoDeclineAttr] = listing.AutoDeclineBelowPercent is { } percent
                 ? Attr.Dec(percent)
                 : new AttributeValue { NULL = true },
+            [AuctionDurationAttr] = listing.AuctionDurationDays is { } days
+                ? Attr.N(days)
+                : new AttributeValue { NULL = true },
+            [AuctionReserveAttr] = Attr.MoneyValueOrNull(listing.AuctionReservePrice),
+            [AuctionBuyoutAttr] = Attr.MoneyValueOrNull(listing.AuctionBuyoutPrice),
+
+            // Units on offer. Absent on rows written before stock existed, which read as one.
+            [StockAttr] = Attr.N(listing.Stock),
             [CreatedAtAttr] = Attr.Instant(listing.CreatedAt),
             [UpdatedAtAttr] = Attr.Instant(listing.UpdatedAt),
             [PublishedAtAttr] = Attr.InstantOrNull(listing.PublishedAt),
@@ -132,6 +150,16 @@ internal static class ListingItem
             createdAt: item.GetInstant(CreatedAtAttr),
             updatedAt: item.GetInstant(UpdatedAtAttr),
             publishedAt: item.GetInstantOrNull(PublishedAtAttr),
-            version: item.GetLongOrDefault(VersionAttr));
+            version: item.GetLongOrDefault(VersionAttr),
+
+            // Absent on rows written before auction terms were stored; read as "not set".
+            auctionDurationDays: item.TryGetValue(AuctionDurationAttr, out var days) && days.N is { } n
+                ? int.Parse(n, System.Globalization.CultureInfo.InvariantCulture)
+                : null,
+            auctionReservePrice: item.GetMoneyOrNull(AuctionReserveAttr),
+            auctionBuyoutPrice: item.GetMoneyOrNull(AuctionBuyoutAttr),
+            stock: item.TryGetValue(StockAttr, out var stockValue) && stockValue.N is { } stockText
+                ? int.Parse(stockText, System.Globalization.CultureInfo.InvariantCulture)
+                : 1);
     }
 }

@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Auctions;
 using Koleksi.Domain.Common;
 using Microsoft.Extensions.Logging;
@@ -17,21 +18,18 @@ namespace Koleksi.Application.Features.Auctions;
 /// </remarks>
 public sealed partial class BuyoutHandler(
     IAuctionRepository auctions,
-    IListingSearchIndex searchIndex,
+    IListingRepository listings,
+    AuctionCloseAnnouncer announcer,
     IAuctionEventPublisher events,
     ICurrentUser currentUser,
     IClock clock,
+    PublicIdentityResolver identities,
     ILogger<BuyoutHandler> logger)
 {
     [LoggerMessage(
         Level = LogLevel.Debug,
         Message = "Buyout on {ListingId} lost a concurrency race on attempt {Attempt}; retrying.")]
     private static partial void LogRetry(ILogger logger, string listingId, int attempt);
-
-    [LoggerMessage(
-        Level = LogLevel.Warning,
-        Message = "Buyout on {ListingId} saved, but updating its browse-index price failed.")]
-    private static partial void LogPriceIndexFailed(ILogger logger, string listingId, Exception exception);
 
     [LoggerMessage(
         Level = LogLevel.Warning,
@@ -45,8 +43,12 @@ public sealed partial class BuyoutHandler(
         ArgumentException.ThrowIfNullOrWhiteSpace(listingId);
 
         var buyerId = currentUser.RequireUserId();
-        var buyerUsername = currentUser.Username
-            ?? throw DomainException.For("auction.no_username", "Your profile is missing a username.");
+        var buyerUsername = (await identities.ResolveAsync(buyerId, ct).ConfigureAwait(false)).Handle;
+
+        if (!await AuctionListingGuard.EnsureForSaleAsync(listings, listingId, ct).ConfigureAwait(false))
+        {
+            return BuyoutResult.NotFound;
+        }
 
         for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
@@ -68,17 +70,6 @@ public sealed partial class BuyoutHandler(
 
                 try
                 {
-                    await searchIndex
-                        .UpdatePriceAsync(listingId, outcome.CurrentPrice.Rupiah, auction.BidCount, ct)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception failure) when (failure is not OperationCanceledException)
-                {
-                    LogPriceIndexFailed(logger, listingId, failure);
-                }
-
-                try
-                {
                     await events.PublishAsync(
                         listingId,
                         new AuctionPriceUpdate(
@@ -95,6 +86,12 @@ public sealed partial class BuyoutHandler(
                 {
                     LogEventPublishFailed(logger, listingId, failure);
                 }
+
+                // A buyout is a close like any other (D-03): the lot leaves browse and "ending soon",
+                // the page is told it is over, and the winner and seller get the same notices the
+                // sweep sends. The auction row is already saved as Ended, which also took it out of
+                // the sweep's close-time index, so nothing else will ever announce it.
+                await announcer.AnnounceAsync(auction, ct).ConfigureAwait(false);
 
                 return new BuyoutResult(Found: true, FinalPriceRupiah: outcome.CurrentPrice.Rupiah);
             }

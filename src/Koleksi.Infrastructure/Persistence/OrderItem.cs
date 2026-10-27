@@ -24,6 +24,11 @@ internal static class OrderItem
     private const string DeliveredAtAttr = "deliveredAt";
     private const string ReleasedAtAttr = "releasedAt";
     private const string VersionAttr = "version";
+    private const string FeePercentAttr = "feePercent";
+    private const string SourceAttr = "source";
+    private const string SourceReferenceAttr = "sourceRef";
+    private const string PaymentDueAtAttr = "paymentDueAt";
+    private const string TrackingCheckedAtAttr = "trackingCheckedAt";
 
     // Line fields
     private const string LineListingIdAttr = "listingId";
@@ -58,7 +63,12 @@ internal static class OrderItem
     private const string DisputeResolutionAttr = "resolution";
     private const string DisputeResolvedAtAttr = "resolvedAt";
 
+    /// <summary>The due-index state name for shipped parcels waiting to be asked about (one state for Shipped and InTransit).</summary>
+    public const string TrackingState = "Tracking";
+
     public static string VersionAttribute => VersionAttr;
+
+    public static string EscrowStateAttribute => EscrowStateAttr;
 
     public static Dictionary<string, AttributeValue> ToItem(Order order)
     {
@@ -104,6 +114,19 @@ internal static class OrderItem
             [ReleasedAtAttr] = Attr.InstantOrNull(order.ReleasedAt),
             [VersionAttr] = Attr.N(order.Version),
 
+            // The commission rate this order was created under. Absent on rows written before it was
+            // kept, which read as the current rate (Order.AppliedFeePercent).
+            [FeePercentAttr] = order.FeePercentSnapshot is { } feePercent
+                ? Attr.Dec(feePercent)
+                : new AttributeValue { NULL = true },
+
+            // Where the purchase came from and when it stops being payable. Both are absent on rows
+            // written before they were kept, which read as a plain sale due 15 minutes after creation.
+            [SourceAttr] = Attr.EnumValue(order.Source),
+            [SourceReferenceAttr] = Attr.SOrNull(order.SourceReference),
+            [PaymentDueAtAttr] = Attr.Instant(order.PaymentDueAt),
+            [TrackingCheckedAtAttr] = Attr.InstantOrNull(order.TrackingCheckedAt),
+
             [DynamoTable.SellerPk] = Attr.S(DynamoTable.SellerPkValue(order.SellerId)),
             [DynamoTable.SellerSk] = Attr.S(
                 DynamoTable.SellerSkValue(DynamoTable.OrderIndexPrefix(), createdAt, order.Id)),
@@ -112,7 +135,48 @@ internal static class OrderItem
                 DynamoTable.BuyerSkValue(DynamoTable.OrderIndexPrefix(), createdAt, order.Id)),
         };
 
+        // The sweep's index entry. Sparse by state: an order carries these only while a clock is
+        // running on it (the payment window while awaiting payment, the confirmation window while
+        // delivered), and every other state writes the item without them. Orders are always written
+        // as a whole item (AddManyAsync, UpdateAsync), so omitting the attributes is what removes the
+        // entry; nothing patches an order in place.
+        if (DueEntryFor(order) is { } due)
+        {
+            item[DynamoTable.AuctionEndPk] = Attr.S(DynamoTable.OrderDuePkValue(due.State, DynamoTable.ShardOf(order.Id)));
+            item[DynamoTable.AuctionEndSk] = Attr.S(DynamoTable.OrderDueSkValue(due.DueAt, order.Id));
+        }
+
         return item;
+    }
+
+    /// <summary>
+    /// The sweep entry an order should hold right now, or <c>null</c> when no clock is running on it.
+    /// </summary>
+    /// <remarks>
+    /// An awaiting-payment order is due once its payment deadline has passed. A delivered order is
+    /// due at its auto-release time; a disputed one is not in <c>Delivered</c> and so is never swept,
+    /// which is how an open dispute keeps funds frozen. A shipped parcel is due whenever the courier
+    /// should next be asked about it (<see cref="Order.NextTrackingCheckAt"/>), and leaves the index the
+    /// moment it is reported delivered.
+    /// </remarks>
+    internal static (string State, DateTimeOffset DueAt)? DueEntryFor(Order order)
+    {
+        ArgumentNullException.ThrowIfNull(order);
+
+        return order.EscrowState switch
+        {
+            EscrowState.AwaitingPayment => (nameof(EscrowState.AwaitingPayment), order.PaymentDueAt),
+            EscrowState.Delivered when order.AutoReleaseAt is { } releaseAt => (nameof(EscrowState.Delivered), releaseAt),
+            EscrowState.Shipped or EscrowState.InTransit when order.NextTrackingCheckAt is { } checkAt => (TrackingState, checkAt),
+
+            // The back office's dispute queues ride the same sparse index under states of their own, which no sweep asks for. An
+            // open dispute is keyed by when it was opened (so the queue reads oldest first), a resolved one by when it was resolved.
+            // Because an order is always written whole, the key appears when it enters Disputed and is gone when the ruling lands.
+            EscrowState.Disputed when order.Dispute is { } open => (DynamoTable.DisputedQueueState, open.OpenedAt),
+            EscrowState.Released or EscrowState.Refunded when order.Dispute is { ResolvedAt: { } resolvedAt } =>
+                (DynamoTable.DisputeResolvedQueueState, resolvedAt),
+            _ => null,
+        };
     }
 
     public static Order ToDomain(Dictionary<string, AttributeValue> item)
@@ -156,7 +220,15 @@ internal static class OrderItem
             shippedAt: item.GetInstantOrNull(ShippedAtAttr),
             deliveredAt: item.GetInstantOrNull(DeliveredAtAttr),
             releasedAt: item.GetInstantOrNull(ReleasedAtAttr),
-            version: item.GetLongOrDefault(VersionAttr));
+            version: item.GetLongOrDefault(VersionAttr),
+            platformFeePercent: item.GetDecimalOrNull(FeePercentAttr),
+            source: item.TryGetValue(SourceAttr, out var source) && source.S is { Length: > 0 } sourceName
+                && Enum.TryParse<OrderSource>(sourceName, out var parsedSource)
+                    ? parsedSource
+                    : OrderSource.FixedPrice,
+            paymentDueAt: item.GetInstantOrNull(PaymentDueAtAttr),
+            trackingCheckedAt: item.GetInstantOrNull(TrackingCheckedAtAttr),
+            sourceReference: item.GetStringOrNull(SourceReferenceAttr));
     }
 
     private static Dictionary<string, AttributeValue> ShipToToMap(ShippingAddress address) =>

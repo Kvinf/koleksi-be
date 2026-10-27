@@ -45,6 +45,29 @@ internal sealed partial class CognitoIdentityService(
     /// </remarks>
     internal const string HttpClientName = "CognitoHostedUi";
 
+    /// <summary>What the pre-sign-up trigger puts at the start of its refusal when the address is already registered.</summary>
+    internal const string PreSignUpEmailRegistered = "EMAIL_REGISTERED:";
+
+    /// <summary>
+    /// How the account that already holds the address signs in (<see cref="EmailAccount"/>), when the pre-sign-up
+    /// trigger refused the sign-up for that reason; otherwise <c>null</c>. Cognito wraps the trigger's message in its
+    /// own text ("PreSignUp failed with error EMAIL_REGISTERED:google."), so it is looked for, not compared.
+    /// </summary>
+    internal static string? EmailRegisteredKind(UserLambdaValidationException failure)
+    {
+        ArgumentNullException.ThrowIfNull(failure);
+
+        var message = failure.Message;
+        if (message.Contains(PreSignUpEmailRegistered + EmailAccount.Google, StringComparison.Ordinal))
+        {
+            return EmailAccount.Google;
+        }
+
+        return message.Contains(PreSignUpEmailRegistered + EmailAccount.Password, StringComparison.Ordinal)
+            ? EmailAccount.Password
+            : null;
+    }
+
 
     public async Task<AuthenticatedSession?> SignInAsync(
         string email, string password, CancellationToken ct)
@@ -129,6 +152,13 @@ internal sealed partial class CognitoIdentityService(
             // A handle is public — it is the shop name — so saying it is taken reveals
             // nothing that browsing to /toko/{handle} would not.
             return RegistrationOutcome.Failed("auth.username_taken");
+        }
+        catch (UserLambdaValidationException failure) when (EmailRegisteredKind(failure) is not null)
+        {
+            // The pre-sign-up trigger (koleksi-infra/lambda/pre-signup) found a confirmed account that already holds
+            // this address and refused to create a second one. It names how that account signs in. The identity
+            // path has no AWS authority of its own, so the lookup lives in the trigger, not here.
+            return RegistrationOutcome.EmailRegistered(EmailRegisteredKind(failure)!);
         }
         catch (AliasExistsException)
         {
@@ -513,6 +543,227 @@ internal sealed partial class CognitoIdentityService(
     }
 
     /// <summary>
+    /// Asks the pool to email a reset code. <c>ForgotPassword</c> is an unauthenticated
+    /// Cognito API, so this keeps the class's no-AWS-authority footing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every Cognito failure is swallowed, on purpose. With <c>preventUserExistenceErrors</c>
+    /// on the client the pool already answers an unknown address with a normal-looking
+    /// success, but the other refusals are not so uniform: an unconfirmed account, an account
+    /// that signs in only through Google (no verified email on a native login to deliver to),
+    /// the per-user send limit and a failed email delivery all surface as exceptions that
+    /// only <i>existing</i> accounts can trigger. Reporting any of them would tell a stranger
+    /// which addresses are registered. The reader of a swallowed one simply never receives a
+    /// code, which the page's neutral copy already allows for.
+    /// </para>
+    /// <para>
+    /// The Cognito call is made whether or not the account exists, so the request takes the
+    /// same shape of time either way. An exception that is not one of the Cognito refusals
+    /// below (a dropped connection, say) is not swallowed: it fails the same way for every
+    /// address, so it reveals nothing.
+    /// </para>
+    /// </remarks>
+    public async Task<string?> RequestPasswordResetAsync(string email, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(email);
+
+        try
+        {
+            await provider.ForgotPasswordAsync(
+                new ForgotPasswordRequest { ClientId = options.ClientId, Username = email },
+                ct).ConfigureAwait(false);
+        }
+        catch (AmazonCognitoIdentityProviderException exception)
+            when (exception is UserNotFoundException
+                or InvalidParameterException
+                or NotAuthorizedException
+                or UserNotConfirmedException
+                or LimitExceededException
+                or CodeDeliveryFailureException
+                or TooManyRequestsException)
+        {
+            // The exception type only: its message can echo the address back.
+            var kind = exception.GetType().Name;
+            LogPasswordResetNotSent(logger, kind);
+        }
+
+        // Cognito emails the code and this process never sees it.
+        return null;
+    }
+
+    /// <summary>
+    /// Completes the reset with <c>ConfirmForgotPassword</c>, also unauthenticated.
+    /// </summary>
+    /// <remarks>
+    /// Sessions that already exist are <b>not</b> ended by this call. It is made without AWS
+    /// credentials, and the only Cognito operation that revokes another person's refresh
+    /// tokens without the person's own access token (<c>AdminUserGlobalSignOut</c>) needs
+    /// them — authority this class deliberately does not hold. Existing refresh tokens
+    /// therefore live out their thirty days; the signed-in <i>change</i> path
+    /// (<see cref="ChangePasswordAsync"/>) does revoke them. See the report notes.
+    /// </remarks>
+    public async Task<PasswordOutcome> ConfirmPasswordResetAsync(
+        string email, string code, string newPassword, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(email);
+        ArgumentException.ThrowIfNullOrWhiteSpace(code);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newPassword);
+
+        try
+        {
+            await provider.ConfirmForgotPasswordAsync(
+                new ConfirmForgotPasswordRequest
+                {
+                    ClientId = options.ClientId,
+                    Username = email,
+                    ConfirmationCode = code,
+                    Password = newPassword,
+                },
+                ct).ConfigureAwait(false);
+
+            return PasswordOutcome.Success;
+        }
+        catch (AmazonCognitoIdentityProviderException exception)
+            when (PasswordFailureCode(exception, PasswordOperation.Reset) is { } failure)
+        {
+            if (exception is TooManyRequestsException or LimitExceededException)
+            {
+                LogThrottled(logger);
+            }
+
+            return PasswordOutcome.Failed(failure);
+        }
+    }
+
+    /// <summary>
+    /// Changes the caller's password with <c>ChangePassword</c>, which authenticates with the
+    /// access token rather than AWS credentials, then signs the account out everywhere.
+    /// </summary>
+    /// <remarks>
+    /// <c>GlobalSignOut</c> (also token-authenticated) is what makes "changed because it
+    /// leaked" mean something: Cognito does not revoke refresh tokens merely because the
+    /// password changed, so without it a thief's thirty-day refresh token survives the very
+    /// change meant to evict them. A failure of that second call does not undo the first —
+    /// the password <i>is</i> changed — so it is logged, not surfaced.
+    /// </remarks>
+    public async Task<PasswordOutcome> ChangePasswordAsync(
+        string accessToken, string currentPassword, string newPassword, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accessToken);
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentPassword);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newPassword);
+
+        try
+        {
+            await provider.ChangePasswordAsync(
+                new ChangePasswordRequest
+                {
+                    AccessToken = accessToken,
+                    PreviousPassword = currentPassword,
+                    ProposedPassword = newPassword,
+                },
+                ct).ConfigureAwait(false);
+        }
+        catch (AmazonCognitoIdentityProviderException exception)
+            when (PasswordFailureCode(exception, PasswordOperation.Change) is { } failure)
+        {
+            if (exception is TooManyRequestsException or LimitExceededException)
+            {
+                LogThrottled(logger);
+            }
+
+            return PasswordOutcome.Failed(failure);
+        }
+
+        try
+        {
+            await provider.GlobalSignOutAsync(new GlobalSignOutRequest { AccessToken = accessToken }, ct)
+                .ConfigureAwait(false);
+        }
+        catch (AmazonCognitoIdentityProviderException exception)
+        {
+            var kind = exception.GetType().Name;
+            LogGlobalSignOutFailed(logger, kind);
+        }
+
+        return PasswordOutcome.Success;
+    }
+
+    /// <summary>
+    /// A federated (Google) user has no Koleksi.id password: Cognito marks it with the
+    /// <c>identities</c> attribute and a <c>Google_…</c> username.
+    /// </summary>
+    public async Task<bool> CanChangePasswordAsync(string accessToken, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accessToken);
+
+        try
+        {
+            var user = await provider
+                .GetUserAsync(new GetUserRequest { AccessToken = accessToken }, ct)
+                .ConfigureAwait(false);
+
+            return !IsFederated(user.Username, user.UserAttributes);
+        }
+        catch (NotAuthorizedException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsFederated(string? username, IEnumerable<AttributeType>? attributes) =>
+        (username is not null && username.StartsWith("Google_", StringComparison.Ordinal))
+        || (attributes?.Any(attribute =>
+            string.Equals(attribute.Name, "identities", StringComparison.Ordinal)
+            && !string.IsNullOrWhiteSpace(attribute.Value)) ?? false);
+
+    internal enum PasswordOperation
+    {
+        Reset,
+        Change,
+    }
+
+    /// <summary>
+    /// Maps a Cognito refusal onto the stable code the frontend translates, or <c>null</c>
+    /// for one this flow has no answer to (which then propagates as an error).
+    /// </summary>
+    /// <remarks>
+    /// Nothing here may separate "no such account" from "wrong code": for a reset, an unknown
+    /// user, a user without a pending code and a wrong code are all
+    /// <c>auth.code_invalid</c>. A change is token-authenticated, so there is no account to
+    /// hide — but <c>NotAuthorizedException</c> is Cognito's one answer for a wrong current
+    /// password <i>and</i> a revoked or expired token, and the API's own bearer validation has
+    /// already vouched for the token a moment earlier, so it is reported as the wrong password.
+    /// </remarks>
+    internal static string? PasswordFailureCode(
+        AmazonCognitoIdentityProviderException exception, PasswordOperation operation)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        return exception switch
+        {
+            CodeMismatchException => "auth.code_invalid",
+            ExpiredCodeException => "auth.code_expired",
+            InvalidPasswordException => "auth.password_too_weak",
+            LimitExceededException or TooManyRequestsException => "auth.try_again_later",
+
+            // The frontend and endpoint already bound the password's length, so for a reset
+            // this can only be a refusal about the account's state — and a stranger must not
+            // be able to tell that from a wrong code.
+            InvalidParameterException => operation == PasswordOperation.Reset
+                ? "auth.code_invalid"
+                : "auth.invalid_details",
+            UserNotFoundException or UserNotConfirmedException when operation == PasswordOperation.Reset
+                => "auth.code_invalid",
+            NotAuthorizedException => operation == PasswordOperation.Reset
+                ? "auth.code_invalid"
+                : "auth.current_password_invalid",
+            _ => null,
+        };
+    }
+
+    /// <summary>
     /// Maps Cognito's result onto our own session record.
     /// </summary>
     /// <remarks>
@@ -536,6 +787,16 @@ internal sealed partial class CognitoIdentityService(
         Level = Microsoft.Extensions.Logging.LogLevel.Warning,
         Message = "Cognito throttled an identity request.")]
     private static partial void LogThrottled(ILogger logger);
+
+    [LoggerMessage(
+        Level = Microsoft.Extensions.Logging.LogLevel.Information,
+        Message = "A password-reset request produced no code: Cognito answered {ExceptionType}.")]
+    private static partial void LogPasswordResetNotSent(ILogger logger, string exceptionType);
+
+    [LoggerMessage(
+        Level = Microsoft.Extensions.Logging.LogLevel.Warning,
+        Message = "A password change succeeded but signing the account out everywhere failed: {ExceptionType}.")]
+    private static partial void LogGlobalSignOutFailed(ILogger logger, string exceptionType);
 
     [LoggerMessage(
         Level = Microsoft.Extensions.Logging.LogLevel.Information,

@@ -1,7 +1,10 @@
 # Local-only infrastructure stand-ins. Nothing here is deployed — see infra/ for that.
 #
 # dynamodb-local backs the single table (README "Getting started" still documents
-# `dotnet run scripts/dev-table.cs` to create it once this is up).
+# `dotnet run scripts/dev-table.cs` to create it once this is up). Data persists in the
+# koleksi-dynamodb-data volume across `docker compose down` and machine restarts — "user:
+# root" sidesteps a permission mismatch between the image's non-root default user and a
+# freshly created named volume, which otherwise fails with a permission error on write.
 #
 # minio is an S3-compatible object store that Koleksi.Infrastructure's S3MediaStorage
 # talks to directly when Koleksi:Media:ServiceUrl is set (appsettings.Development.json

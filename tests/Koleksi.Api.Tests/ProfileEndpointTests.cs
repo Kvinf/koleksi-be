@@ -46,6 +46,7 @@ public sealed class ProfileEndpointTests(KoleksiApiFactory factory) : IClassFixt
                     phone = "081234567890",
                     line = "Jl. Mawar No. 1",
                     city = "Bandung",
+                    province = "Jawa Barat",
                     postalCode = "40123",
                     isDefault = true,
                 },
@@ -61,6 +62,7 @@ public sealed class ProfileEndpointTests(KoleksiApiFactory factory) : IClassFixt
         var addresses = body.GetProperty("addresses");
         addresses.GetArrayLength().ShouldBe(1);
         addresses[0].GetProperty("city").GetString().ShouldBe("Bandung");
+        addresses[0].GetProperty("province").GetString().ShouldBe("Jawa Barat");
         addresses[0].GetProperty("id").GetString().ShouldNotBeNullOrWhiteSpace();
     }
 

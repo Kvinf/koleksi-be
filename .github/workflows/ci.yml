@@ -1,0 +1,83 @@
+name: CI
+
+# Builds and tests every pull request and every push to main. A push to main that passes also asks the infra repository
+# to deploy the dev stage (the `request-deploy` job); the deploy itself, its AWS sign-in and its safety checks live there,
+# in koleksi-infra/.github/workflows/deploy-dev.yml. See koleksi-infra/docs/ci-cd.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # Restore fails if a package no longer matches its committed packages.lock.json (Directory.Build.props), which is
+      # the supply-chain check; it is not bypassed here.
+      - run: dotnet restore Koleksi.slnx
+
+      # Warnings are errors in this solution.
+      - run: dotnet build Koleksi.slnx -c Release --no-restore
+
+      - name: Unit tests
+        run: >
+          dotnet test Koleksi.slnx -c Release --no-build
+          --filter "FullyQualifiedName!~Koleksi.Infrastructure.IntegrationTests"
+
+      # The integration tests need DynamoDB Local. A fresh in-memory container, never the shared one a developer keeps,
+      # and never real AWS: nothing in this job has credentials.
+      - name: Start DynamoDB Local
+        run: |
+          docker run -d --name koleksi-dynamodb-ci -p 8001:8000 amazon/dynamodb-local:latest \
+            -jar DynamoDBLocal.jar -inMemory -sharedDb
+          for i in $(seq 1 30); do
+            if curl --silent --output /dev/null http://localhost:8001; then exit 0; fi
+            sleep 1
+          done
+          echo "::error::DynamoDB Local did not start."; docker logs koleksi-dynamodb-ci; exit 1
+
+      - name: Integration tests
+        env:
+          KOLEKSI_TEST_DYNAMODB_URL: http://localhost:8001
+        run: dotnet test tests/Koleksi.Infrastructure.IntegrationTests -c Release --no-build
+
+  request-deploy:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A repository_dispatch to the infra repository. The token is a fine-grained personal access token that can write
+      # contents on that one repository and nothing else; it cannot read this code or reach AWS.
+      - name: Ask koleksi-infra to deploy dev
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::error::The DEPLOY_DISPATCH_TOKEN secret is not set; nothing was deployed. See koleksi-infra/docs/ci-cd.md."
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $DISPATCH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/Kvinf/kolesi-infra/dispatches \
+            --data "{\"event_type\":\"deploy-dev\",\"client_payload\":{\"source\":\"koleksi-be\",\"sha\":\"$SHA\"}}"
+          echo "Requested a dev deploy for $SHA."

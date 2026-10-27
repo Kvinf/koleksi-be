@@ -1,6 +1,11 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Infrastructure;
+using Koleksi.Application.Features.Orders;
+using Koleksi.Application.Features.Standing;
 using Koleksi.Domain.Common;
 using Koleksi.Domain.Users;
+
+using Microsoft.AspNetCore.RateLimiting;
 
 using static Koleksi.Api.Endpoints.IdempotencyHeader;
 
@@ -26,6 +31,9 @@ namespace Koleksi.Api.Endpoints;
 /// </remarks>
 internal static class ProfileEndpoints
 {
+    /// <summary>Longest phone number accepted. A real one is 8 to 15 digits; this leaves room for spacing.</summary>
+    private const int MaxPhoneLength = 20;
+
     public static IEndpointRouteBuilder MapProfileEndpoints(this IEndpointRouteBuilder app)
     {
         ArgumentNullException.ThrowIfNull(app);
@@ -37,17 +45,30 @@ internal static class ProfileEndpoints
         group.MapPost("/avatar", SetAvatarAsync).WithName("SetProfileAvatar");
         group.MapPost("/bank-account", SetBankAccountAsync).WithName("SetProfileBankAccount");
         group.MapPost("/id-verification", SubmitIdVerificationAsync).WithName("SubmitIdVerification");
-        group.MapPost("/phone/otp", RequestPhoneOtpAsync).WithName("RequestProfilePhoneOtp");
+        group.MapPost("/phone/otp", RequestPhoneOtpAsync)
+            .RequireRateLimiting(RateLimitPolicies.VerificationCode)
+            .WithName("RequestProfilePhoneOtp");
         group.MapPost("/phone/otp/verify", VerifyPhoneOtpAsync).WithName("VerifyProfilePhoneOtp");
 
         return app;
     }
 
     private static async Task<IResult> GetProfileAsync(
-        ICurrentUser user, IProfileRepository repository, IMediaStorage media, CancellationToken ct)
+        ICurrentUser user,
+        IProfileRepository repository,
+        IMediaStorage media,
+        AccountStandingService standing,
+        CancellationToken ct)
     {
-        var profile = await repository.FindAsync(user.RequireUserId(), ct).ConfigureAwait(false);
-        return Results.Ok(ToResponse(profile, media));
+        var userId = user.RequireUserId();
+        var profile = await repository.FindAsync(userId, ct).ConfigureAwait(false);
+
+        // How many warnings the account carries, and whether it is banned. Only on this read: the saved
+        // responses (which the idempotency store replays) never carry it, so a stale copy cannot be served.
+        return Results.Ok(ToResponse(profile, media) with
+        {
+            Standing = await standing.GetAsync(userId, ct).ConfigureAwait(false),
+        });
     }
 
     private static async Task<IResult> SaveProfileAsync(
@@ -67,19 +88,38 @@ internal static class ProfileEndpoints
             return Results.BadRequest(new { code = "profile.name_required" });
         }
 
+        // A body that leaves the list out (or sends null, or a null row) is a malformed request,
+        // not a server fault: without this the Select below threw a NullReferenceException (500).
+        if (request.Addresses is null || request.Addresses.Any(a => a is null))
+        {
+            return Results.BadRequest(new { code = "profile.addresses_invalid" });
+        }
+
         var response = await idempotency.RunOnceAsync(
-            "profile.update",
+            $"profile.update:{user.RequireUserId()}",
             Read(http),
             TimeSpan.FromMinutes(2),
             async () =>
             {
                 var userId = user.RequireUserId();
+                var existing = await repository.FindAsync(userId, ct).ConfigureAwait(false);
+
+                // A new address must carry a province. One stored before provinces existed may be
+                // re-saved without it (matched by its own id), so editing the name or another
+                // address does not fail on a row the owner has not touched.
+                var legacyIds = existing is null
+                    ? []
+                    : existing.Addresses
+                        .Where(a => string.IsNullOrWhiteSpace(a.Province))
+                        .Select(a => a.Id)
+                        .ToHashSet(StringComparer.Ordinal);
+
                 var addresses = request.Addresses
                     .Select(a => Address.Create(
-                        a.Id, a.Label, a.RecipientName, a.Phone, a.Line, a.City, a.PostalCode, a.IsDefault))
+                        a.Id, a.Label, a.RecipientName, a.Phone, a.Line, a.City, a.Province, a.PostalCode, a.IsDefault,
+                        provinceOptional: a.Id is not null && legacyIds.Contains(a.Id)))
                     .ToList();
 
-                var existing = await repository.FindAsync(userId, ct).ConfigureAwait(false);
                 if (existing is null)
                 {
                     var created = UserProfile.CreateEmpty(userId, clock);
@@ -116,15 +156,16 @@ internal static class ProfileEndpoints
         }
 
         // The grant constrained the upload; this confirms something was actually put there
-        // before it is attached to the account. Without it, a caller could name a key it
-        // never uploaded to and have this endpoint accept it on faith.
-        if (!await media.VerifyUploadedAsync(request.AvatarKey, ct).ConfigureAwait(false))
+        // before it is attached to the account, and that it is the caller's own avatar upload
+        // rather than someone else's photo (or any other purpose's object) named by key.
+        if (!await media.VerifyOwnedUploadAsync(MediaPurpose.Avatar, user.RequireUserId(), request.AvatarKey, ct)
+            .ConfigureAwait(false))
         {
             return Results.BadRequest(new { code = "profile.avatar_not_uploaded" });
         }
 
         var response = await idempotency.RunOnceAsync(
-            "profile.avatar",
+            $"profile.avatar:{user.RequireUserId()}",
             Read(http),
             TimeSpan.FromMinutes(2),
             () => WithProfileAsync(
@@ -141,6 +182,7 @@ internal static class ProfileEndpoints
         ICurrentUser user,
         IProfileRepository repository,
         IMediaStorage media,
+        PayoutSender payoutSender,
         IIdempotencyStore idempotency,
         IClock clock,
         HttpRequest http,
@@ -158,7 +200,7 @@ internal static class ProfileEndpoints
         var account = BankAccount.Create(request.BankName, request.AccountNumber, request.AccountHolderName);
 
         var response = await idempotency.RunOnceAsync(
-            "profile.bank-account",
+            $"profile.bank-account:{user.RequireUserId()}",
             Read(http),
             TimeSpan.FromMinutes(2),
             () => WithProfileAsync(
@@ -166,6 +208,9 @@ internal static class ProfileEndpoints
                 (profile, clk) => profile.SetBankAccount(account, clk),
                 media, ct),
             ct).ConfigureAwait(false);
+
+        // Money that was waiting for exactly this goes out now instead of on the next backoff.
+        await payoutSender.RetryWaitingForBankAccountAsync(user.RequireUserId(), ct).ConfigureAwait(false);
 
         return Results.Ok(response);
     }
@@ -177,28 +222,37 @@ internal static class ProfileEndpoints
         IMediaStorage media,
         IIdempotencyStore idempotency,
         IClock clock,
+        FeaturesOptions features,
         HttpRequest http,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        if (!features.IdVerificationEnabled)
+        {
+            return Results.NotFound(new { code = "feature.unavailable" });
+        }
 
         if (string.IsNullOrWhiteSpace(request.IdPhotoKey))
         {
             return Results.BadRequest(new { code = "profile.id_photos_required" });
         }
 
-        if (!await media.VerifyUploadedAsync(request.IdPhotoKey, ct).ConfigureAwait(false))
+        // Must be the caller's own identity-document upload (private bucket), not another
+        // account's document and not a public photo. The key is then kept on the profile.
+        if (!await media.VerifyOwnedUploadAsync(MediaPurpose.IdentityDocument, user.RequireUserId(), request.IdPhotoKey, ct)
+            .ConfigureAwait(false))
         {
             return Results.BadRequest(new { code = "profile.id_photos_not_uploaded" });
         }
 
         var response = await idempotency.RunOnceAsync(
-            "profile.id-verification",
+            $"profile.id-verification:{user.RequireUserId()}",
             Read(http),
             TimeSpan.FromMinutes(2),
             () => WithProfileAsync(
                 user, repository, clock,
-                (profile, clk) => profile.SubmitIdVerification(clk),
+                (profile, clk) => profile.SubmitIdVerification(request.IdPhotoKey, clk),
                 media, ct),
             ct).ConfigureAwait(false);
 
@@ -210,11 +264,20 @@ internal static class ProfileEndpoints
     /// — otherwise to the account's own email, resolved from the caller's own bearer token,
     /// so a reader who has not typed a number in yet is never blocked from verifying at all.
     /// </summary>
+    /// <remarks>
+    /// Every request sends a real SMS or email, so it is limited three ways: the per-user
+    /// <see cref="RateLimitPolicies.VerificationCode"/> bucket in front, then, server-side, a
+    /// cooldown between codes to the same destination and a cap per account per hour
+    /// (<see cref="IVerificationThrottle"/>). The throttle runs inside the idempotent work, so a
+    /// double-tap carrying one key replays the first answer instead of tripping the cooldown.
+    /// </remarks>
     private static async Task<IResult> RequestPhoneOtpAsync(
         RequestPhoneOtpRequest request,
+        ICurrentUser user,
         IIdentityService identity,
         IPhoneVerificationService phoneVerification,
         IEmailVerificationService emailVerification,
+        IVerificationThrottle throttle,
         IIdempotencyStore idempotency,
         HttpRequest http,
         CancellationToken ct)
@@ -223,6 +286,13 @@ internal static class ProfileEndpoints
 
         var phone = request.Phone?.Trim();
         var viaEmail = string.IsNullOrWhiteSpace(phone);
+
+        // A phone number is a handful of digits; anything longer is not one, and would otherwise
+        // flow into an SMS destination and a storage key as sent.
+        if (!viaEmail && phone!.Length > MaxPhoneLength)
+        {
+            return Results.BadRequest(new { code = "profile.phone_invalid" });
+        }
 
         string? email = null;
         if (viaEmail)
@@ -239,16 +309,33 @@ internal static class ProfileEndpoints
             }
         }
 
+        var userId = user.RequireUserId();
+        var destination = viaEmail ? email! : phone!;
+
         // Short retention, same reasoning as the auth email-OTP request: long enough to
         // absorb a double-tap on "Send code", short enough that a genuine second request a
         // minute later still gets a fresh one.
         var devCode = await idempotency.RunOnceAsync(
-            viaEmail ? "profile.email-otp-request" : "profile.phone-otp-request",
+            viaEmail ? $"profile.email-otp-request:{userId}" : $"profile.phone-otp-request:{userId}",
             Read(http),
             TimeSpan.FromSeconds(30),
-            () => viaEmail
-                ? emailVerification.RequestCodeAsync(email!, ct)
-                : phoneVerification.RequestCodeAsync(phone!, ct),
+            async () =>
+            {
+                switch (await throttle.TryAcquireAsync(userId, destination, ct).ConfigureAwait(false))
+                {
+                    case VerificationThrottleResult.Cooldown:
+                        throw DomainException.For(
+                            "profile.otp_cooldown", "A code was just sent. Wait a minute before asking for another.");
+
+                    case VerificationThrottleResult.HourlyLimit:
+                        throw DomainException.For(
+                            "profile.otp_limit", "Too many codes requested. Try again later.");
+                }
+
+                return viaEmail
+                    ? await emailVerification.RequestCodeAsync(userId, email!, ct).ConfigureAwait(false)
+                    : await phoneVerification.RequestCodeAsync(userId, phone!, ct).ConfigureAwait(false);
+            },
             ct).ConfigureAwait(false);
 
         // devCode is null in production — see IPhoneVerificationService.RequestCodeAsync's
@@ -279,6 +366,13 @@ internal static class ProfileEndpoints
 
         var phone = request.Phone?.Trim();
         var code = request.Code.Trim();
+
+        // Neither is a value a real client sends; bounded before it reaches a storage key.
+        if (code.Length > 12 || phone is { Length: > MaxPhoneLength })
+        {
+            return Results.BadRequest(new { code = "profile.code_invalid" });
+        }
+
         bool verified;
 
         if (string.IsNullOrWhiteSpace(phone))
@@ -287,11 +381,11 @@ internal static class ProfileEndpoints
             var email = bearerToken is null ? null : await identity.GetEmailAsync(bearerToken, ct).ConfigureAwait(false);
 
             verified = email is not null
-                && await emailVerification.VerifyCodeAsync(email, code, ct).ConfigureAwait(false);
+                && await emailVerification.VerifyCodeAsync(user.RequireUserId(), email, code, ct).ConfigureAwait(false);
         }
         else
         {
-            verified = await phoneVerification.VerifyCodeAsync(phone, code, ct).ConfigureAwait(false);
+            verified = await phoneVerification.VerifyCodeAsync(user.RequireUserId(), phone, code, ct).ConfigureAwait(false);
         }
 
         // Deliberately not idempotency-wrapped — same reasoning as /api/auth/otp/verify: the
@@ -357,7 +451,7 @@ internal static class ProfileEndpoints
                 : null,
             profile.Addresses
                 .Select(a => new AddressResponse(
-                    a.Id, a.Label, a.RecipientName, a.Phone, a.Line, a.City, a.PostalCode, a.IsDefault))
+                    a.Id, a.Label, a.RecipientName, a.Phone, a.Line, a.City, a.Province, a.PostalCode, a.IsDefault))
                 .ToList());
     }
 
@@ -368,6 +462,7 @@ internal static class ProfileEndpoints
         string Phone,
         string Line,
         string City,
+        string? Province,
         string PostalCode,
         bool IsDefault);
 
@@ -394,6 +489,7 @@ internal static class ProfileEndpoints
         string Phone,
         string Line,
         string City,
+        string? Province,
         string PostalCode,
         bool IsDefault);
 
@@ -406,5 +502,6 @@ internal static class ProfileEndpoints
         string? AvatarUrl,
         string IdVerificationStatus,
         BankAccountResponse? BankAccount,
-        IReadOnlyList<AddressResponse> Addresses);
+        IReadOnlyList<AddressResponse> Addresses,
+        StandingView? Standing = null);
 }

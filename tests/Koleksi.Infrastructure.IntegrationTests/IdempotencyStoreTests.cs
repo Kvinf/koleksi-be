@@ -1,4 +1,5 @@
 using Amazon.DynamoDBv2.Model;
+using Koleksi.Application.Abstractions;
 using Koleksi.Infrastructure.Persistence;
 using Shouldly;
 
@@ -101,6 +102,109 @@ public sealed class IdempotencyStoreTests : DynamoTestBase
         await Should.ThrowAsync<ArgumentOutOfRangeException>(
             () => Table.Idempotency.TryClaimAsync(
                 Scope, Guid.NewGuid().ToString("N"), TimeSpan.FromHours(hours), Ct));
+    }
+
+    [DynamoLocalFact]
+    public async Task An_expired_claim_can_be_claimed_again_and_its_old_result_is_gone()
+    {
+        // DynamoDB's TTL sweep can lag by days. Without enforcing expiry in the condition, a
+        // re-used key would stay claimed (and replay its old result) until the sweep ran.
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+        await Table.Idempotency.RecordResultAsync(Scope, key, "old", Ct);
+
+        Table.Clock.UtcNow += Retention + TimeSpan.FromSeconds(1);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeTrue();
+        (await Table.Idempotency.GetRecordedResultAsync(Scope, key, Ct)).ShouldBeNull();
+    }
+
+    [DynamoLocalFact]
+    public async Task An_expired_claims_result_is_not_replayed()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+        await Table.Idempotency.RecordResultAsync(Scope, key, "old", Ct);
+
+        (await Table.Idempotency.GetRecordedResultAsync(Scope, key, Ct)).ShouldBe("old");
+
+        Table.Clock.UtcNow += Retention + TimeSpan.FromSeconds(1);
+
+        (await Table.Idempotency.GetRecordedResultAsync(Scope, key, Ct)).ShouldBeNull();
+    }
+
+    [DynamoLocalFact]
+    public async Task A_claim_that_has_not_expired_still_refuses_a_second_claim()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+
+        // A finished request. One with no result is only held for the in-flight lease (below).
+        await Table.Idempotency.RecordResultAsync(Scope, key, "done", Ct);
+
+        Table.Clock.UtcNow += Retention - TimeSpan.FromSeconds(1);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeFalse();
+    }
+
+    [DynamoLocalFact]
+    public async Task A_claim_with_no_result_is_held_while_its_request_may_still_be_running()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+
+        Table.Clock.UtcNow += IdempotencyExtensions.InFlightLease - TimeSpan.FromSeconds(1);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeFalse();
+    }
+
+    [DynamoLocalFact]
+    public async Task A_claim_whose_request_died_can_be_taken_over_once_its_lease_has_run_out()
+    {
+        // A crashed or timed-out Lambda never records a result and never releases. Without the
+        // lease its key would answer "in progress" for the whole retention window.
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+
+        Table.Clock.UtcNow += IdempotencyExtensions.InFlightLease + TimeSpan.FromSeconds(1);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeTrue();
+    }
+
+    [DynamoLocalFact]
+    public async Task A_lease_never_lets_a_finished_request_be_taken_over()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+        await Table.Idempotency.RecordResultAsync(Scope, key, "done", Ct);
+
+        Table.Clock.UtcNow += IdempotencyExtensions.InFlightLease + TimeSpan.FromMinutes(5);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeFalse();
+        (await Table.Idempotency.GetRecordedResultAsync(Scope, key, Ct)).ShouldBe("done");
+    }
+
+    [DynamoLocalFact]
+    public async Task A_released_claim_can_be_claimed_again_straight_away()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+
+        await Table.Idempotency.ReleaseClaimAsync(Scope, key, Ct);
+
+        (await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct)).ShouldBeTrue();
+    }
+
+    [DynamoLocalFact]
+    public async Task Releasing_never_discards_a_recorded_result()
+    {
+        var key = Guid.NewGuid().ToString("N");
+        await Table.Idempotency.TryClaimAsync(Scope, key, Retention, Ct);
+        await Table.Idempotency.RecordResultAsync(Scope, key, "done", Ct);
+
+        await Table.Idempotency.ReleaseClaimAsync(Scope, key, Ct);
+
+        (await Table.Idempotency.GetRecordedResultAsync(Scope, key, Ct)).ShouldBe("done");
     }
 
     [DynamoLocalFact]

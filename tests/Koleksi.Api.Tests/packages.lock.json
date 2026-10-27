@@ -150,6 +150,14 @@
           "Amazon.Lambda.Core": "3.0.0"
         }
       },
+      "AWSSDK.ApiGatewayManagementApi": {
+        "type": "Transitive",
+        "resolved": "4.0.100.16",
+        "contentHash": "GsvfEdSUyKR/s6SGXpZphwOjVbREOHOGwiwCl95BNP3zdZFkuXKt2r2w1T0WheH0smMViZdeD1SjHiwSscRD7w==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.102.8, 5.0.0)"
+        }
+      },
       "AWSSDK.CognitoIdentity": {
         "type": "Transitive",
         "resolved": "4.0.2.18",
@@ -169,8 +177,8 @@
       },
       "AWSSDK.Core": {
         "type": "Transitive",
-        "resolved": "4.0.101.1",
-        "contentHash": "NtMRfAGDrdb5PVnTL4vIrnPuPSXbBw0j9+voVMYmgsH5Ep5H4tuNMkPJZCOO9q99mh0L9ClOwVkQHCliR5uOLA=="
+        "resolved": "4.0.102.8",
+        "contentHash": "90B9Skhl+ORbtWNXrrmGdGhGvAfZiPmZafRYrB/xHelZjePIwPvXioqz9UiiF1vo21eDLzTnXh5EC4RjbNWsFQ=="
       },
       "AWSSDK.DynamoDBv2": {
         "type": "Transitive",
@@ -705,7 +713,7 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
-      "koleksi.api": {
+      "bootstrap": {
         "type": "Project",
         "dependencies": {
           "Amazon.Lambda.AspNetCoreServer.Hosting": "[2.2.0, )",
@@ -730,6 +738,7 @@
       "koleksi.infrastructure": {
         "type": "Project",
         "dependencies": {
+          "AWSSDK.ApiGatewayManagementApi": "[4.0.100.16, )",
           "AWSSDK.CognitoIdentityProvider": "[4.0.103.2, )",
           "AWSSDK.DynamoDBv2": "[4.0.103.1, )",
           "AWSSDK.Extensions.NETCore.Setup": "[4.0.100.8, )",
@@ -742,6 +751,21 @@
           "Microsoft.Extensions.Http": "[10.0.11, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.11, )",
           "Microsoft.Extensions.Options.ConfigurationExtensions": "[10.0.11, )"
+        }
+      }
+    },
+    "net10.0/linux-arm64": {
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "QTXEoQBzz00SFWbo7nAg1Ogd4f99lwqcO9uAJ7MYSLEUR28f6As32QktrqG2Fr9cfAfd1GjLyGYspE7Ipj7P6w=="
+      },
+      "System.Management": {
+        "type": "Transitive",
+        "resolved": "6.0.1",
+        "contentHash": "10J1D0h/lioojphfJ4Fuh5ZUThT/xOVHdV9roGBittKKNP2PMjrvibEdbVTGZcPra1399Ja3tqIJLyQrc5Wmhg==",
+        "dependencies": {
+          "System.CodeDom": "6.0.0"
         }
       }
     }

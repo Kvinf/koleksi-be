@@ -119,7 +119,21 @@ internal sealed partial class PaymentGateway(
         // synchronous by design — it must be callable from a request filter before the
         // body is bound — and the secret is cached after the first webhook, so this waits
         // only on a cold start.
-        var key = secret.GetAsync(CancellationToken.None).GetAwaiter().GetResult();
+        byte[] key;
+        try
+        {
+            key = secret.GetAsync(CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (Exception failure) when (failure is not OperationCanceledException)
+        {
+            // Not a forged webhook and not a bug in the notification: the signing key could not be read
+            // (Secrets Manager unreachable or throttled, an empty secret). The cause is logged here, at
+            // error level; the caller answers 503 so the gateway delivers the notification again, rather
+            // than a generic 500 that hides what is wrong.
+            LogSecretUnavailable(logger, failure);
+            throw new PaymentVerificationUnavailableException(
+                "The payment webhook signing key could not be read.", failure);
+        }
 
         var signature = headers.TryGetValue(SignatureHeader, out var value) ? value : null;
 
@@ -154,9 +168,8 @@ internal sealed partial class PaymentGateway(
                 SettledAmount: amount.Value,
                 ProcessorReference: payload.TransactionId ?? string.Empty,
 
-                // Falls back to the processor's transaction id so duplicate deliveries are
-                // still detectable when no separate event id is sent.
-                EventId: payload.EventId ?? payload.TransactionId ?? payload.OrderId);
+                EventId: DeriveEventId(
+                    payload.EventId, payload.OrderId, MapStatus(payload.TransactionStatus), payload.TransactionId));
         }
         catch (JsonException)
         {
@@ -167,6 +180,21 @@ internal sealed partial class PaymentGateway(
             return null;
         }
     }
+
+    /// <summary>
+    /// The key a notification is deduplicated on: the processor's own event id when it sends one,
+    /// otherwise order + status + transaction.
+    /// </summary>
+    /// <remarks>
+    /// Keyed on the transaction id alone (the old fallback), a "pending" notification and the later
+    /// "settled" one for the same transaction shared a key, and the idempotency store replayed the
+    /// first answer for the second, so a payment was never applied (QA D-02). The status is part of
+    /// the key so each state change is its own event, while a redelivery of the same one still matches.
+    /// </remarks>
+    internal static string DeriveEventId(string? eventId, string orderId, PaymentStatus status, string? transactionId) =>
+        !string.IsNullOrWhiteSpace(eventId)
+            ? eventId
+            : $"{orderId}:{status}:{transactionId}";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -192,6 +220,11 @@ internal sealed partial class PaymentGateway(
         string? TransactionStatus,
         string? TransactionId,
         string? EventId);
+
+    [LoggerMessage(
+        Level = LogLevel.Error,
+        Message = "A payment webhook could not be verified because its signing key could not be read. The gateway will be told to retry.")]
+    private static partial void LogSecretUnavailable(ILogger logger, Exception failure);
 
     [LoggerMessage(
         Level = LogLevel.Warning,

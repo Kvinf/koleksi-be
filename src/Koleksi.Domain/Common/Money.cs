@@ -60,6 +60,14 @@ public readonly record struct Money : IComparable<Money>
         ? throw new ArgumentOutOfRangeException(nameof(percentage), percentage, "Percentage cannot be negative.")
         : new Money((long)Math.Round(Rupiah * percentage / 100m, MidpointRounding.AwayFromZero));
 
+    /// <summary>
+    /// Whether this amount is strictly less than <paramref name="percentage"/> percent of
+    /// <paramref name="reference"/>, compared exactly: no rounding, so 99.999 of 200.000 (49.9995%) is
+    /// below 50%. Decimal holds any rupiah amount times 100 without overflow.
+    /// </summary>
+    public bool IsBelowPercentOf(Money reference, decimal percentage) =>
+        (decimal)Rupiah * 100m < (decimal)reference.Rupiah * percentage;
+
     /// <summary>This amount expressed as a percentage of <paramref name="reference"/>.</summary>
     /// <remarks>Used for the "X% of asking" hint on the offer modal.</remarks>
     public decimal AsPercentageOf(Money reference) => reference.IsZero

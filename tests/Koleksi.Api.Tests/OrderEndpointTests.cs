@@ -105,7 +105,7 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
 
         using var response = await client.PostAsJsonAsync(
             $"/api/orders/{order.Id}/shipment",
-            new { trackingNumber = "JX1234567890", packedParcelPhotoKey = "k1", trackingLabelPhotoKey = "k2", shippedOn = "2026-01-05" });
+            ShipBody(TestData.SellerId));
 
         response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
         (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.not_shippable");
@@ -119,7 +119,7 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
 
         using var shipResponse = await sellerClient.PostAsJsonAsync(
             $"/api/orders/{order.Id}/shipment",
-            new { trackingNumber = "JX1234567890", packedParcelPhotoKey = "k1", trackingLabelPhotoKey = "k2", shippedOn = "2026-01-05" });
+            ShipBody(TestData.SellerId));
 
         shipResponse.StatusCode.ShouldBe(HttpStatusCode.OK);
         (await shipResponse.ReadJsonAsync()).GetProperty("escrowState").GetString().ShouldBe("Shipped");
@@ -153,9 +153,9 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
     }
 
     [Fact]
-    public async Task A_buyer_can_open_a_dispute_on_a_paid_order()
+    public async Task A_buyer_can_open_a_dispute_on_a_shipped_order()
     {
-        var order = SeedPaidOrder();
+        var order = SeedShippedOrder();
         using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
 
         using var response = await client.PostAsJsonAsync(
@@ -163,6 +163,55 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
         (await response.ReadJsonAsync()).GetProperty("escrowState").GetString().ShouldBe("Disputed");
+    }
+
+    // ─── Disputing an order that has not shipped (QA P-04) ───────────────────────
+
+    [Fact]
+    public async Task A_buyer_cannot_dispute_a_paid_order_the_seller_has_had_no_time_to_ship()
+    {
+        var order = SeedPaidOrder();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var response = await client.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/dispute", new { reason = "Barang belum dikirim sama sekali." });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.dispute_too_early");
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task A_buyer_can_dispute_a_paid_order_that_is_still_not_shipped_after_the_ship_window()
+    {
+        var order = SeedPaidOrder();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        factory.Clock.Advance(Order.ShipWindow + TimeSpan.FromMinutes(1));
+        try
+        {
+            using var response = await client.PostAsJsonAsync(
+                $"/api/orders/{order.Id}/dispute", new { reason = "Barang belum dikirim sama sekali." });
+
+            response.StatusCode.ShouldBe(HttpStatusCode.OK);
+            (await response.ReadJsonAsync()).GetProperty("escrowState").GetString().ShouldBe("Disputed");
+        }
+        finally
+        {
+            factory.Clock.Advance(-(Order.ShipWindow + TimeSpan.FromMinutes(1)));
+        }
+    }
+
+    [Fact]
+    public async Task The_order_says_when_a_paid_unshipped_order_can_first_be_disputed()
+    {
+        var order = SeedPaidOrder();
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var response = await buyer.GetAsync($"/api/orders/{order.Id}");
+
+        var from = (await response.ReadJsonAsync()).GetProperty("order").GetProperty("disputableFrom").GetDateTimeOffset();
+        from.ShouldBe(order.PaidAt!.Value + Order.ShipWindow);
     }
 
     [Fact]
@@ -201,6 +250,553 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
         var updatedListing = await factory.Listings.FindAsync(listing.Id, CancellationToken.None);
         updatedListing.ShouldNotBeNull();
         updatedListing.Status.ShouldBe(ListingStatus.Sold);
+    }
+
+    // ─── No account ids on the wire ──────────────────────────────────────────────
+
+    private static readonly System.Text.RegularExpressions.Regex AccountIdShape = new(
+        "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static void ShouldCarryNoAccountIdentity(string wire)
+    {
+        foreach (var id in new[] { TestData.SellerId, TestData.BidderId, TestData.RivalId })
+        {
+            wire.ShouldNotContain(id, Case.Insensitive);
+        }
+
+        wire.ShouldNotContain("@");
+        AccountIdShape.IsMatch(wire).ShouldBeFalse("a Cognito-subject-shaped value is on the wire");
+        wire.ShouldNotContain("buyerId", Case.Insensitive);
+        wire.ShouldNotContain("sellerId", Case.Insensitive);
+    }
+
+    [Fact]
+    public async Task Order_lists_and_detail_name_the_parties_by_public_handle_and_never_by_account_id()
+    {
+        var order = SeedPaidOrder();
+        var buyerHandle = factory.PublicHandleOf(TestData.BidderId);
+        var sellerHandle = factory.PublicHandleOf(TestData.SellerId);
+
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        foreach (var (client, path, role) in new[]
+        {
+            (buyer, "/api/orders/mine", "buyer"),
+            (seller, "/api/orders/selling", "seller"),
+        })
+        {
+            using var response = await client.GetAsync(path);
+            response.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+            var text = await response.ReadTextAsync();
+            ShouldCarryNoAccountIdentity(text);
+
+            var row = System.Text.Json.JsonDocument.Parse(text).RootElement.GetProperty("items")
+                .EnumerateArray().Single(item => item.GetProperty("id").GetString() == order.Id);
+            row.GetProperty("viewerRole").GetString().ShouldBe(role);
+            row.GetProperty("buyerHandle").GetString().ShouldBe(buyerHandle);
+            row.GetProperty("sellerHandle").GetString().ShouldBe(sellerHandle);
+        }
+
+        foreach (var (client, role) in new[] { (buyer, "buyer"), (seller, "seller") })
+        {
+            using var response = await client.GetAsync($"/api/orders/{order.Id}");
+            response.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+            var text = await response.ReadTextAsync();
+            ShouldCarryNoAccountIdentity(text);
+
+            var body = System.Text.Json.JsonDocument.Parse(text).RootElement;
+            body.GetProperty("viewerRole").GetString().ShouldBe(role);
+            body.GetProperty("order").GetProperty("viewerRole").GetString().ShouldBe(role);
+            body.GetProperty("order").GetProperty("buyerHandle").GetString().ShouldBe(buyerHandle);
+            body.GetProperty("order").GetProperty("sellerHandle").GetString().ShouldBe(sellerHandle);
+        }
+    }
+
+    [Fact]
+    public async Task A_checkout_response_carries_no_account_id_or_email()
+    {
+        var listing = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs(
+            "b8a6f7d2-4c11-4a39-9a0e-0e5a3c1d7f01", "checkout.leakcheck");
+
+        using var response = await client.PostAsJsonAsync("/api/orders/checkout", CheckoutBody("FixedPrice", listing.Id));
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        ShouldCarryNoAccountIdentity(await response.ReadTextAsync());
+    }
+
+    // ─── A stranger is told "not found", exactly as for a missing order ──────────
+
+    [Fact]
+    public async Task A_stranger_shipping_releasing_or_disputing_gets_the_same_answer_a_missing_order_gets()
+    {
+        var order = SeedPaidOrder();
+        var missingId = TestData.UnknownListingId;
+        using var stranger = factory.CreateClientAs(TestData.RivalId, TestData.RivalUsername);
+
+        var attempts = new (string Name, Func<string, Task<HttpResponseMessage>> Send)[]
+        {
+            ("ship", id => stranger.PostAsJsonAsync($"/api/orders/{id}/shipment", ShipBody(TestData.RivalId))),
+            ("release", id => stranger.PostAsync($"/api/orders/{id}/release", null)),
+            ("dispute", id => stranger.PostAsJsonAsync($"/api/orders/{id}/dispute", new { reason = "Saya ingin tahu." })),
+        };
+
+        foreach (var (name, send) in attempts)
+        {
+            using var real = await send(order.Id);
+            using var missing = await send(missingId);
+
+            real.StatusCode.ShouldBe(HttpStatusCode.NotFound, name);
+            missing.StatusCode.ShouldBe(HttpStatusCode.NotFound, name);
+            (await real.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.not_found", name);
+            (await real.ReadTextAsync()).ShouldBe(await missing.ReadTextAsync(), name);
+        }
+
+        // And nothing happened to the order.
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task A_party_in_the_wrong_role_keeps_the_coded_refusal()
+    {
+        var order = SeedPaidOrder();
+
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        using var buyerShips = await buyer.PostAsJsonAsync($"/api/orders/{order.Id}/shipment", ShipBody(TestData.BidderId));
+        buyerShips.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        (await buyerShips.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.forbidden");
+
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        using var sellerDisputes = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/dispute", new { reason = "Saya penjual." });
+        sellerDisputes.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
+        (await sellerDisputes.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.forbidden");
+    }
+
+    // ─── Disputes ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_dispute_cannot_be_opened_twice_and_the_first_reason_is_kept()
+    {
+        var order = SeedShippedOrder();
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var first = await buyer.PostAsJsonAsync($"/api/orders/{order.Id}/dispute", new { reason = "Alasan pertama." });
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var second = await buyer.PostAsJsonAsync($"/api/orders/{order.Id}/dispute", new { reason = "Alasan kedua." });
+        second.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await second.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.already_disputed");
+
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.Dispute!.Reason.ShouldBe("Alasan pertama.");
+    }
+
+    [Theory]
+    [InlineData("", "order.dispute_reason_required")]
+    [InlineData("   ", "order.dispute_reason_required")]
+    public async Task A_blank_dispute_reason_is_refused(string reason, string code)
+    {
+        var order = SeedPaidOrder();
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var response = await buyer.PostAsJsonAsync($"/api/orders/{order.Id}/dispute", new { reason });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe(code);
+    }
+
+    [Fact]
+    public async Task A_dispute_reason_is_capped_at_one_thousand_characters()
+    {
+        var order = SeedShippedOrder();
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var tooLong = await buyer.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/dispute", new { reason = new string('x', Dispute.MaxReasonLength + 1) });
+        tooLong.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        (await tooLong.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.dispute_reason_too_long");
+
+        using var atTheLimit = await buyer.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/dispute", new { reason = new string('x', Dispute.MaxReasonLength) });
+        atTheLimit.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    // ─── Shipment inputs ─────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("", "shipment.tracking_too_short")]
+    [InlineData("   ", "shipment.tracking_too_short")]
+    [InlineData("SHORT", "shipment.tracking_too_short")]
+    public async Task A_missing_or_short_tracking_number_is_refused(string tracking, string code)
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        using var response = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, trackingNumber: tracking));
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe(code);
+    }
+
+    [Fact]
+    public async Task A_tracking_number_is_capped_at_sixty_four_characters()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        using var tooLong = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, trackingNumber: new string('9', Shipment.MaxTrackingNumberLength + 1)));
+
+        tooLong.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await tooLong.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.tracking_too_long");
+
+        using var atTheLimit = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, trackingNumber: new string('9', Shipment.MaxTrackingNumberLength)));
+        atTheLimit.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task A_shipping_date_in_the_future_is_refused_but_a_timezone_ahead_is_not()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var today = DateOnly.FromDateTime(factory.Clock.UtcNow.UtcDateTime);
+
+        using var future = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, shippedOn: today.AddDays(2).ToString("yyyy-MM-dd")));
+        future.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await future.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.shipped_on_future");
+
+        using var tomorrowInJakarta = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, shippedOn: today.AddDays(1).ToString("yyyy-MM-dd")));
+        tomorrowInJakarta.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task Shipment_proof_must_be_the_sellers_own_shipping_upload_that_exists()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        var mine = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "mine");
+        var someoneElses = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.RivalId, "theirs");
+        var myAvatar = TestData.MediaKey(MediaPurpose.Avatar, TestData.SellerId, "me.jpg");
+        var myListingPhoto = TestData.PhotoKey(TestData.SellerId, "photo");
+
+        foreach (var bad in new[] { someoneElses, myAvatar, myListingPhoto, "shipping/../x/y", "k1" })
+        {
+            using var response = await seller.PostAsJsonAsync(
+                $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: bad, labelKey: mine));
+            response.StatusCode.ShouldBe(HttpStatusCode.Conflict, bad);
+            (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_not_uploaded", bad);
+
+            using var label = await seller.PostAsJsonAsync(
+                $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: mine, labelKey: bad));
+            label.StatusCode.ShouldBe(HttpStatusCode.Conflict, bad);
+        }
+
+        // Nothing was saved by the refusals.
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+
+        // A key that is the seller's own but was never actually uploaded is refused too.
+        factory.Media.NextVerifyUploadedResult = false;
+        try
+        {
+            using var notUploaded = await seller.PostAsJsonAsync(
+                $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId));
+            notUploaded.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+            (await notUploaded.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_not_uploaded");
+        }
+        finally
+        {
+            factory.Media.NextVerifyUploadedResult = true;
+        }
+
+        using var ok = await seller.PostAsJsonAsync($"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId));
+        ok.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    // ─── An Idempotency-Key names one request (QA P-06) ──────────────────────────
+
+    [Fact]
+    public async Task A_retry_of_the_same_checkout_replays_the_first_order()
+    {
+        var listing = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", listing.Id));
+        using var retry = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", listing.Id));
+
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+        retry.StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await retry.ReadJsonAsync()).GetProperty("orderId").GetString()
+            .ShouldBe((await first.ReadJsonAsync()).GetProperty("orderId").GetString());
+    }
+
+    [Fact]
+    public async Task The_same_key_on_a_different_checkout_is_refused_not_answered_with_the_first_order()
+    {
+        var one = SeedFixedPriceListing();
+        var other = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", one.Id));
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var different = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", other.Id));
+
+        different.StatusCode.ShouldBe(HttpStatusCode.UnprocessableEntity);
+        (await different.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("idempotency.key_reused");
+    }
+
+    [Fact]
+    public async Task The_same_key_with_a_different_shipment_is_refused()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(seller, $"/api/orders/{order.Id}/shipment", key, ShipBody(TestData.SellerId));
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var different = await PostWithKeyAsync(seller, $"/api/orders/{order.Id}/shipment", key, ShipBody(TestData.SellerId));
+
+        different.StatusCode.ShouldBe(HttpStatusCode.UnprocessableEntity);
+        (await different.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("idempotency.key_reused");
+    }
+
+    private static async Task<HttpResponseMessage> PostWithKeyAsync(HttpClient client, string url, string key, object body)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = JsonContent.Create(body) };
+        request.Headers.Add("Idempotency-Key", key);
+        return await client.SendAsync(request);
+    }
+
+    // ─── Proof and waybill reuse (QA P-03) ───────────────────────────────────────
+
+    [Fact]
+    public async Task The_same_proof_photos_cannot_back_a_second_order()
+    {
+        var first = SeedPaidOrder();
+        var second = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        var packed = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "reuse-packed");
+        var label = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "reuse-label");
+
+        using var firstShipment = await seller.PostAsJsonAsync(
+            $"/api/orders/{first.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        firstShipment.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // A different waybill, the same two photos.
+        using var reused = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        reused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await reused.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_reused");
+
+        // One photo of the old set is enough to be refused.
+        using var half = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, labelKey: label));
+        half.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await half.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_reused");
+
+        (await factory.Orders.FindAsync(second.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+
+        // New photos of this parcel are accepted.
+        using var fresh = await seller.PostAsJsonAsync($"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId));
+        fresh.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task The_same_tracking_number_cannot_be_used_on_a_second_order()
+    {
+        var first = SeedPaidOrder();
+        var second = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        using var firstShipment = await seller.PostAsJsonAsync(
+            $"/api/orders/{first.Id}/shipment", ShipBody(TestData.SellerId, trackingNumber: "JNE-REUSED-001"));
+        firstShipment.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // Spacing and case do not make it a different waybill: it is stored trimmed and upper-cased.
+        using var reused = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, trackingNumber: "  jne-reused-001 "));
+        reused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await reused.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.tracking_reused");
+
+        (await factory.Orders.FindAsync(second.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task One_photo_cannot_fill_both_proof_slots()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var only = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "one-photo");
+
+        using var response = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: only, labelKey: only));
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_duplicate");
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task A_refused_shipment_does_not_use_up_its_photos()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var packed = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "kept-packed");
+        var label = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "kept-label");
+
+        // Refused for a short waybill, before anything is claimed.
+        using var refused = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, trackingNumber: "SHORT", packedKey: packed, labelKey: label));
+        refused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+
+        // The same photos, corrected, still work for the same order.
+        using var corrected = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        corrected.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task Missing_proof_keys_are_a_bad_request()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        using var response = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            new { trackingNumber = "JX1234567890", shippedOn = "2026-01-05" });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_required");
+    }
+
+    [Fact]
+    public async Task A_double_submitted_shipment_replays_the_first_answer_when_it_carries_a_key()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var key = Guid.NewGuid().ToString();
+        var body = ShipBody(TestData.SellerId);
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"/api/orders/{order.Id}/shipment")
+            {
+                Content = JsonContent.Create(body),
+            };
+            request.Headers.Add("Idempotency-Key", key);
+            using var response = await seller.SendAsync(request);
+
+            // Without the key the second tap would be a 409 order.not_shippable.
+            response.StatusCode.ShouldBe(HttpStatusCode.OK, $"attempt {attempt}");
+        }
+    }
+
+    // ─── Checkout input ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_checkout_without_a_ship_to_is_a_bad_request_not_a_server_error()
+    {
+        var listing = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs("c1a6f7d2-4c11-4a39-9a0e-0e5a3c1d7f02", "checkout.noshipto");
+
+        using var response = await client.PostAsJsonAsync(
+            "/api/orders/checkout", new { source = "FixedPrice", referenceId = listing.Id, courierCode = "jne" });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("checkout.invalid_details");
+    }
+
+    [Fact]
+    public async Task A_checkout_with_a_blank_or_oversized_address_field_is_refused()
+    {
+        var listing = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs("c2a6f7d2-4c11-4a39-9a0e-0e5a3c1d7f03", "checkout.badaddress");
+
+        foreach (var shipTo in new object[]
+        {
+            new { recipientName = "", phone = "081234567890", street = "Jl. Merdeka", city = "Bandung", province = "Jawa Barat", postalCode = "40111" },
+            new { recipientName = "Rangga", phone = "081234567890", street = "   ", city = "Bandung", province = "Jawa Barat", postalCode = "40111" },
+            new { recipientName = "Rangga", phone = "081234567890", street = "Jl. Merdeka", city = "Bandung", province = "Jawa Barat" },
+            new { recipientName = new string('x', 101), phone = "081234567890", street = "Jl. Merdeka", city = "Bandung", province = "Jawa Barat", postalCode = "40111" },
+            new { recipientName = "Rangga", phone = new string('1', 21), street = "Jl. Merdeka", city = "Bandung", province = "Jawa Barat", postalCode = "40111" },
+            new { recipientName = "Rangga", phone = "081234567890", street = new string('x', 241), city = "Bandung", province = "Jawa Barat", postalCode = "40111" },
+        })
+        {
+            using var response = await client.PostAsJsonAsync(
+                "/api/orders/checkout", new { source = "FixedPrice", referenceId = listing.Id, shipTo, courierCode = "jne" });
+
+            response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+            (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("checkout.invalid_details");
+        }
+    }
+
+    // ─── The payment webhook ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task An_oversized_webhook_body_is_refused_before_any_signature_work()
+    {
+        factory.Payments.NextNotification = null;
+        using var client = factory.CreateClient();
+
+        using var content = new StringContent(new string('a', 64 * 1024 + 1), System.Text.Encoding.UTF8, "application/json");
+        using var response = await client.PostAsync("/api/payments/webhook", content);
+
+        response.StatusCode.ShouldBe(HttpStatusCode.RequestEntityTooLarge);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("payment.payload_too_large");
+    }
+
+    [Fact]
+    public async Task A_webhook_body_at_the_limit_still_reaches_signature_verification()
+    {
+        factory.Payments.NextNotification = null;
+        using var client = factory.CreateClient();
+
+        using var content = new StringContent(new string('a', 64 * 1024), System.Text.Encoding.UTF8, "application/json");
+        using var response = await client.PostAsync("/api/payments/webhook", content);
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
+    }
+
+    private static int _shipmentCounter;
+
+    /// <summary>
+    /// A shipment body. Unless a test says otherwise the waybill and both photos are new for every call, because one set of
+    /// proof cannot back two orders.
+    /// </summary>
+    private static object ShipBody(
+        string ownerId,
+        string? trackingNumber = null,
+        string shippedOn = "2026-01-05",
+        string? packedKey = null,
+        string? labelKey = null)
+    {
+        var n = Interlocked.Increment(ref _shipmentCounter);
+
+        return new
+        {
+            trackingNumber = trackingNumber ?? $"JX{n:D10}",
+            packedParcelPhotoKey = packedKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, $"packed-{n}"),
+            trackingLabelPhotoKey = labelKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, $"label-{n}"),
+            shippedOn,
+        };
     }
 
     private static object CheckoutBody(string source, string referenceId) => new
@@ -257,6 +853,20 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
             [new OrderLine(listing.Id, listing.Title, null, listing.Price, Quantity: 1)],
             SampleShippingAddress(), FlatRateCourier(), new FixedTestClock());
         order.ConfirmPayment(order.GrandTotal, new FixedTestClock());
+        factory.Orders.Seed(order);
+        return order;
+    }
+
+    private Order SeedShippedOrder()
+    {
+        var order = SeedPaidOrder();
+        order.MarkShipped(
+            Shipment.Create(
+                "jne", $"JX{Interlocked.Increment(ref _shipmentCounter):D10}",
+                TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "seeded-packed"),
+                TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "seeded-label"),
+                new DateOnly(2026, 3, 1)),
+            TestData.SellerId, new FixedTestClock());
         factory.Orders.Seed(order);
         return order;
     }

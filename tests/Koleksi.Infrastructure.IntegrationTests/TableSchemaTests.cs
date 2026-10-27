@@ -136,10 +136,19 @@ internal sealed record DeployedIndexShape(string PartitionKey, string SortKey, s
 /// <summary>Locates and parses the synthesized CDK template.</summary>
 internal static class CdkTemplate
 {
-    private const string RelativePath = "infra/cdk.out/Koleksi-Data-dev.template.json";
+    /// <summary>
+    /// Where the template can be, relative to each folder on the way up. The infra repo is a sibling of this one (<c>koleksi-infra</c>);
+    /// <c>infra</c> is the name it had before the repositories were split. Looking only for the old name left every schema test
+    /// skipped without anyone noticing. <c>KOLEKSI_INFRA_TEMPLATE</c> (an absolute path) overrides both.
+    /// </summary>
+    private static readonly string[] RelativePaths =
+    [
+        "koleksi-infra/cdk.out/Koleksi-Data-dev.template.json",
+        "infra/cdk.out/Koleksi-Data-dev.template.json",
+    ];
 
     public const string SkipReason =
-        "The synthesized CDK template was not found. Run: cd infra && npx cdk synth -c stage=dev";
+        "The synthesized CDK template was not found. Run: cd koleksi-infra && npx cdk synth -c stage=dev (or set KOLEKSI_INFRA_TEMPLATE)";
 
     private static readonly Lazy<string?> Located = new(Locate, LazyThreadSafetyMode.ExecutionAndPublication);
 
@@ -231,14 +240,22 @@ internal static class CdkTemplate
     /// </remarks>
     private static string? Locate()
     {
+        if (Environment.GetEnvironmentVariable("KOLEKSI_INFRA_TEMPLATE") is { Length: > 0 } fixedPath)
+        {
+            return File.Exists(fixedPath) ? fixedPath : null;
+        }
+
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
 
         while (directory is not null)
         {
-            var candidate = System.IO.Path.Combine(directory.FullName, RelativePath);
-            if (File.Exists(candidate))
+            foreach (var relative in RelativePaths)
             {
-                return candidate;
+                var candidate = System.IO.Path.Combine(directory.FullName, relative);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
             }
 
             directory = directory.Parent;

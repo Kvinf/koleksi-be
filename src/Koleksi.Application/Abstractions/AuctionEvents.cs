@@ -5,11 +5,9 @@ namespace Koleksi.Application.Abstractions;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Implemented as an in-process broadcast — see the concrete type in <c>Koleksi.Api</c> —
-/// which is honest about the current deployment rather than aspirational: one API instance,
-/// one set of open connections. A multi-instance deployment would need this behind a real
-/// fan-out (SNS+SQS, or a managed WebSocket/AppSync service), but nothing above this
-/// interface would change to get there.
+/// Implemented on top of <see cref="IRealtimeBroadcaster"/>, which owns delivery: API
+/// Gateway's WebSocket API in a deployed stage, an in-process hub on a developer's machine.
+/// Nothing above this interface knows which.
 /// </para>
 /// <para>
 /// Only ever carries what is already public on the item page — the visible price, the bid

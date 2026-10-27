@@ -60,5 +60,6 @@ public sealed class FakeProfileRepository : FakeAdapter, IProfileRepository
         profile.Addresses,
         profile.CreatedAt,
         profile.UpdatedAt,
-        profile.Version);
+        profile.Version,
+        profile.IdDocumentKey);
 }

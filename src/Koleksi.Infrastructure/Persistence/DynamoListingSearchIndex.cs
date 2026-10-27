@@ -37,7 +37,7 @@ internal sealed partial class DynamoListingSearchIndex(
     IAmazonDynamoDB dynamo,
     ICategoryRepository categories,
     DynamoOptions options,
-    ILogger<DynamoListingSearchIndex> logger) : IListingSearchIndex
+    ILogger<DynamoListingSearchIndex> logger) : IListingSearchIndex, IListingSuggestionIndex
 {
     /// <summary>
     /// Ceiling on round trips while walking to a deep page.
@@ -142,25 +142,46 @@ internal sealed partial class DynamoListingSearchIndex(
 
         var listing = entry.Listing;
 
-        // Drafts, archived, and suspended listings are absent from browse entirely rather
-        // than present-and-filtered. A row that exists but must never be returned is one
-        // forgotten filter expression away from being returned.
-        if (!listing.IsPubliclyVisible)
+        // Only an Active listing is in browse. Drafts, archived, suspended and SOLD listings are absent
+        // entirely rather than present-and-filtered: a row that exists but must never be returned is one
+        // forgotten filter expression away from being returned. A sold lot's page still resolves by its
+        // link, because that reads the listing row, not this projection.
+        if (listing.Status != ListingStatus.Active)
         {
             await RemoveAsync(listing.Id, ct).ConfigureAwait(false);
             return;
         }
 
-        await dynamo.PutItemAsync(
+        var replaced = await dynamo.PutItemAsync(
             new PutItemRequest
             {
                 TableName = options.TableName,
                 Item = BrowseProjectionItem.ToItem(
                     listing, entry.SellerUsername, entry.AuctionEndsAt, entry.BidCount),
+
+                // The previous row tells us which title words the suggestion rows were written for,
+                // so a renamed listing loses the rows of the words it no longer has, and which facet
+                // counters this row had already been counted in.
+                ReturnValues = ReturnValue.ALL_OLD,
             },
             ct).ConfigureAwait(false);
 
-        await AdjustFacetCountersAsync(listing, delta: 1, ct).ConfigureAwait(false);
+        // Counted once: a listing already in the projection (a seller's edit, a re-publish, a repair
+        // re-index) is counted already, and adding it again inflated every total and the pager (D-04).
+        if (replaced.Attributes is { Count: > 0 } previous)
+        {
+            await AdjustCountersForReplacementAsync(previous, listing, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await AdjustFacetCountersAsync(listing, delta: 1, ct).ConfigureAwait(false);
+        }
+
+        await SyncSuggestionRowsAsync(
+            listing.Id,
+            replaced.Attributes?.GetValueOrDefault(BrowseProjectionItem.TitleAttr)?.S,
+            listing.Title,
+            ct).ConfigureAwait(false);
     }
 
     public async Task UpdatePriceAsync(string listingId, long currentPriceRupiah, int bidCount, CancellationToken ct)
@@ -226,6 +247,9 @@ internal sealed partial class DynamoListingSearchIndex(
         if (response.Attributes is { Count: > 0 } removed)
         {
             await AdjustFacetCountersFromItemAsync(removed, delta: -1, ct).ConfigureAwait(false);
+            await SyncSuggestionRowsAsync(
+                listingId, removed.GetValueOrDefault(BrowseProjectionItem.TitleAttr)?.S, newTitle: null, ct)
+                .ConfigureAwait(false);
         }
     }
 
@@ -533,6 +557,52 @@ internal sealed partial class DynamoListingSearchIndex(
         {
             updates.Add(AdjustCounterAsync(
                 listing.CategoryId, DynamoTable.FacetSkValue(facetKey, value), delta, ct));
+        }
+
+        return Task.WhenAll(updates);
+    }
+
+    /// <summary>
+    /// Moves the counters from what the old row was counted under to what the new listing is, so
+    /// re-indexing a listing that is already counted changes nothing unless a facet really changed.
+    /// </summary>
+    private Task AdjustCountersForReplacementAsync(
+        Dictionary<string, AttributeValue> previous, Listing listing, CancellationToken ct)
+    {
+        if (!string.Equals(
+                previous.GetStringOrNull(BrowseProjectionItem.CategoryIdAttr), listing.CategoryId, StringComparison.Ordinal))
+        {
+            // Not reachable for a live listing (the category is immutable once published), but a repair
+            // re-index must still leave both categories right.
+            return Task.WhenAll(
+                AdjustFacetCountersFromItemAsync(previous, delta: -1, ct),
+                AdjustFacetCountersAsync(listing, delta: 1, ct));
+        }
+
+        var before = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (attribute, value) in previous)
+        {
+            if (attribute.StartsWith(BrowseProjectionItem.FacetPrefix, StringComparison.Ordinal) && value.S is { } facetValue)
+            {
+                before[attribute[BrowseProjectionItem.FacetPrefix.Length..]] = facetValue;
+            }
+        }
+
+        var updates = new List<Task>();
+        foreach (var (facetKey, value) in listing.Attributes)
+        {
+            if (!before.TryGetValue(facetKey, out var old) || !string.Equals(old, value, StringComparison.Ordinal))
+            {
+                updates.Add(AdjustCounterAsync(listing.CategoryId, DynamoTable.FacetSkValue(facetKey, value), 1, ct));
+            }
+        }
+
+        foreach (var (facetKey, old) in before)
+        {
+            if (!listing.Attributes.TryGetValue(facetKey, out var value) || !string.Equals(old, value, StringComparison.Ordinal))
+            {
+                updates.Add(AdjustCounterAsync(listing.CategoryId, DynamoTable.FacetSkValue(facetKey, old), -1, ct));
+            }
         }
 
         return Task.WhenAll(updates);

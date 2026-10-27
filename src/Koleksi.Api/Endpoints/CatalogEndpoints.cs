@@ -1,3 +1,4 @@
+using Koleksi.Api.Security;
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Catalog;
 using Microsoft.AspNetCore.Mvc;
@@ -38,10 +39,54 @@ internal static class CatalogEndpoints
         group.MapGet("/browse", BrowseAsync)
             .WithName("BrowseListings");
 
+        // Identical for every caller, so a shared cache may hold each distinct text for a minute.
+        group.MapGet("/suggest", SuggestAsync)
+            .RequireRateLimiting(RateLimitPolicies.Suggest)
+            .CacheOutput(policy => policy.Expire(TimeSpan.FromSeconds(60)).SetVaryByQuery("q"))
+            .WithName("SuggestSearch");
+
         group.MapGet("/listings/{slugWithId}", GetListingAsync)
             .WithName("GetListing");
 
         return app;
+    }
+
+    /// <summary>
+    /// Autocomplete for the header search box: categories, completed words and live listings.
+    /// </summary>
+    /// <remarks>
+    /// Public data only, and deliberately narrow: no seller, no account id, nothing beyond what a
+    /// suggestion row draws. Text the handler cannot use (too short, too long, no letters) answers
+    /// with empty lists rather than an error, because the box fires on every pause in typing.
+    /// </remarks>
+    private static async Task<IResult> SuggestAsync(
+        HttpContext context,
+        SuggestSearchHandler handler,
+        [FromQuery(Name = "q")] string? text,
+        CancellationToken ct)
+    {
+        var result = await handler.HandleAsync(text, ct).ConfigureAwait(false);
+
+        context.Response.Headers.CacheControl = "public, max-age=60";
+
+        return Results.Ok(new
+        {
+            terms = result.Terms,
+            categories = result.Categories.Select(category => new
+            {
+                category.Slug,
+                name = new { category.Name.Id, category.Name.En },
+            }),
+            items = result.Items.Select(item => new
+            {
+                item.Id,
+                item.Title,
+                item.CategorySlug,
+                item.PriceRupiah,
+                format = item.Format.ToString(),
+                item.PhotoKey,
+            }),
+        });
     }
 
     private static async Task<IResult> GetCategoriesAsync(
@@ -196,7 +241,13 @@ internal static class CatalogEndpoints
             publishedAt = listing.PublishedAt,
             canonicalPath = result.CanonicalPath,
             result.IsOwnListing,
+
+            // Handle and chosen display name only; see PublicIdentityResolver.
+            seller = result.Seller,
             auction = result.Auction,
+
+            // Units on offer and how many are free right now; absent for an auction (always one lot).
+            stock = result.Stock,
         });
     }
 

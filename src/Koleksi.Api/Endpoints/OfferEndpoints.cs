@@ -1,18 +1,22 @@
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Offers;
 using Koleksi.Domain.Offers;
+using static Koleksi.Api.Endpoints.IdempotencyHeader;
 
 namespace Koleksi.Api.Endpoints;
 
 /// <summary>Making, answering, and listing offers on <c>nego</c> listings.</summary>
 /// <remarks>
-/// No <c>AllowAnonymous</c> anywhere in this group — every route needs an identity, either
-/// as the buyer making or withdrawing an offer, or as the seller answering one. The
-/// buyer/seller comes from <see cref="ICurrentUser"/> inside each handler, never from the
-/// route or body, the same reasoning every other write in this product follows.
+/// No <c>AllowAnonymous</c> anywhere in this group — every route needs an identity. Which
+/// side of an offer the caller is on, and whether that side may act in the offer's current
+/// state, is decided inside the domain from <see cref="ICurrentUser"/>, never from the route
+/// or body, the same reasoning every other write in this product follows.
 /// </remarks>
 internal static class OfferEndpoints
 {
+    /// <summary>How long a replayed answer is remembered: long enough for a double tap or a retry.</summary>
+    private static readonly TimeSpan IdempotencyRetention = TimeSpan.FromMinutes(2);
+
     public static IEndpointRouteBuilder MapOfferEndpoints(this IEndpointRouteBuilder app)
     {
         ArgumentNullException.ThrowIfNull(app);
@@ -21,6 +25,8 @@ internal static class OfferEndpoints
 
         var group = app.MapGroup("/api/offers").WithTags("Offers");
 
+        // Accept and decline answer for whichever side it is the turn of: the seller on a
+        // pending offer, the buyer on a counter. The domain refuses anyone else.
         group.MapPost("/{offerId}/accept", AcceptOfferAsync).WithName("AcceptOffer");
         group.MapPost("/{offerId}/decline", DeclineOfferAsync).WithName("DeclineOffer");
         group.MapPost("/{offerId}/counter", CounterOfferAsync).WithName("CounterOffer");
@@ -46,74 +52,100 @@ internal static class OfferEndpoints
             : Results.NotFound(new { code = "offer.listing_not_found" });
     }
 
-    private static async Task<IResult> AcceptOfferAsync(string offerId, AcceptOfferHandler handler, CancellationToken ct) =>
-        ToResult(await handler.HandleAsync(offerId, ct).ConfigureAwait(false));
+    private static async Task<IResult> AcceptOfferAsync(
+        string offerId, AcceptOfferHandler handler, ICurrentUser user, IIdempotencyStore idempotency, HttpRequest http, CancellationToken ct) =>
+        ToResult(await idempotency.RunOnceAsync(
+            $"offer.accept:{user.RequireUserId()}:{offerId}", Read(http), IdempotencyRetention, () => handler.HandleAsync(offerId, ct), ct,
+            InFlightPolicy.Reject)
+            .ConfigureAwait(false));
 
-    private static async Task<IResult> DeclineOfferAsync(string offerId, DeclineOfferHandler handler, CancellationToken ct) =>
-        ToResult(await handler.HandleAsync(offerId, ct).ConfigureAwait(false));
+    private static async Task<IResult> DeclineOfferAsync(
+        string offerId, DeclineOfferHandler handler, ICurrentUser user, IIdempotencyStore idempotency, HttpRequest http, CancellationToken ct) =>
+        ToResult(await idempotency.RunOnceAsync(
+            $"offer.decline:{user.RequireUserId()}:{offerId}", Read(http), IdempotencyRetention, () => handler.HandleAsync(offerId, ct), ct)
+            .ConfigureAwait(false));
 
     private static async Task<IResult> CounterOfferAsync(
-        string offerId, CounterOfferRequest request, CounterOfferHandler handler, CancellationToken ct)
+        string offerId,
+        CounterOfferRequest request,
+        CounterOfferHandler handler,
+        ICurrentUser user,
+        IIdempotencyStore idempotency,
+        HttpRequest http,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return ToResult(await handler.HandleAsync(offerId, request.CounterAmountRupiah, ct).ConfigureAwait(false));
+
+        return ToResult(await idempotency.RunOnceAsync(
+            $"offer.counter:{user.RequireUserId()}:{offerId}",
+            Read(http),
+            IdempotencyRetention,
+            () => handler.HandleAsync(offerId, request.CounterAmountRupiah, ct),
+            ct,
+            InFlightPolicy.Reject).ConfigureAwait(false));
     }
 
-    private static async Task<IResult> WithdrawOfferAsync(string offerId, WithdrawOfferHandler handler, CancellationToken ct) =>
-        ToResult(await handler.HandleAsync(offerId, ct).ConfigureAwait(false));
+    private static async Task<IResult> WithdrawOfferAsync(
+        string offerId, WithdrawOfferHandler handler, ICurrentUser user, IIdempotencyStore idempotency, HttpRequest http, CancellationToken ct) =>
+        ToResult(await idempotency.RunOnceAsync(
+            $"offer.withdraw:{user.RequireUserId()}:{offerId}", Read(http), IdempotencyRetention, () => handler.HandleAsync(offerId, ct), ct)
+            .ConfigureAwait(false));
 
-    private static async Task<IResult> GetOfferAsync(
-        string offerId, ICurrentUser user, IOfferRepository offers, CancellationToken ct)
+    private static async Task<IResult> GetOfferAsync(string offerId, OfferViews views, CancellationToken ct)
     {
-        var offer = await offers.FindAsync(offerId, ct).ConfigureAwait(false);
-        if (offer is null)
-        {
-            return Results.NotFound(new { code = "offer.not_found" });
-        }
-
         // Same coarse answer for "does not exist" and "not yours" — same reasoning
         // OrderEndpoints.GetOrderAsync uses.
-        var callerId = user.RequireUserId();
-        if (!string.Equals(offer.BuyerId, callerId, StringComparison.Ordinal)
-            && !string.Equals(offer.SellerId, callerId, StringComparison.Ordinal))
-        {
-            return Results.NotFound(new { code = "offer.not_found" });
-        }
-
-        return Results.Ok(ToOfferRow(offer));
+        var view = await views.GetAsync(offerId, ct).ConfigureAwait(false);
+        return view is null ? Results.NotFound(new { code = "offer.not_found" }) : Results.Ok(ToOfferRow(view));
     }
 
     private static IResult ToResult(OfferOutcome outcome) => outcome.Found
-        ? Results.Ok(new { status = outcome.Status.ToString(), amountRupiah = outcome.AmountRupiah, outcome.ExpiresAt })
+        ? Results.Ok(new
+        {
+            status = outcome.Status.ToString(),
+            amountRupiah = outcome.AmountRupiah,
+            counterAmountRupiah = outcome.CounterAmountRupiah,
+            outcome.ExpiresAt,
+        })
         : Results.NotFound(new { code = "offer.not_found" });
 
-    private static async Task<IResult> ListMyOffersAsync(
-        ICurrentUser user, IOfferRepository offers, string? cursor, CancellationToken ct)
+    private static async Task<IResult> ListMyOffersAsync(OfferViews views, string? cursor, CancellationToken ct)
     {
-        var page = await offers.ListForBuyerAsync(user.RequireUserId(), cursor, limit: 20, ct).ConfigureAwait(false);
+        var page = await views.ListSentAsync(cursor, ct).ConfigureAwait(false);
         return Results.Ok(new { items = page.Items.Select(ToOfferRow), nextCursor = page.NextCursor });
     }
 
-    private static async Task<IResult> ListReceivedOffersAsync(
-        ICurrentUser user, IOfferRepository offers, string? cursor, CancellationToken ct)
+    private static async Task<IResult> ListReceivedOffersAsync(OfferViews views, string? cursor, CancellationToken ct)
     {
-        var page = await offers.ListForSellerAsync(user.RequireUserId(), cursor, limit: 20, ct).ConfigureAwait(false);
+        var page = await views.ListReceivedAsync(cursor, ct).ConfigureAwait(false);
         return Results.Ok(new { items = page.Items.Select(ToOfferRow), nextCursor = page.NextCursor });
     }
 
-    private static object ToOfferRow(Offer offer) => new
+    /// <summary>
+    /// One offer as its viewer sees it. No user id appears: each party is named by handle,
+    /// and the viewer's own side is stated as <c>viewerRole</c>.
+    /// </summary>
+    private static object ToOfferRow(OfferView view) => new
     {
-        offer.Id,
-        offer.ListingId,
-        offer.SellerId,
-        offer.BuyerId,
-        amountRupiah = offer.Amount.Rupiah,
-        askingPriceRupiah = offer.AskingPrice.Rupiah,
-        percentOfAsking = offer.PercentOfAsking,
-        offer.Message,
-        status = offer.Status.ToString(),
-        offer.CreatedAt,
-        offer.ExpiresAt,
+        view.Offer.Id,
+        view.Offer.ListingId,
+        listingTitle = view.ListingTitle,
+        listingPhotoKey = view.ListingPhotoKey,
+        categorySlug = view.CategorySlug,
+        viewerRole = view.ViewerRole == OfferParty.Buyer ? "buyer" : "seller",
+        sellerUsername = view.SellerHandle,
+        buyerUsername = view.BuyerHandle,
+        amountRupiah = view.Offer.Amount.Rupiah,
+        counterAmountRupiah = view.Offer.CounterAmount?.Rupiah,
+        currentAmountRupiah = view.Offer.CurrentAmount.Rupiah,
+        askingPriceRupiah = view.Offer.AskingPrice.Rupiah,
+        percentOfAsking = view.Offer.PercentOfAsking,
+        view.Offer.Message,
+        status = view.Status.ToString(),
+        view.Offer.CreatedAt,
+        view.Offer.ExpiresAt,
+        view.OrderId,
+        view.CanCheckout,
     };
 
     private sealed record MakeOfferRequest(long AmountRupiah, string? Message);

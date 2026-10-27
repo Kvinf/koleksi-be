@@ -78,15 +78,20 @@ public sealed class FakeListingRepository : FakeAdapter, IListingRepository
     {
         ThrowIfFailing();
 
-        var matches = _listings.Values
+        // The cursor is the id of the last row of the previous page, which is all an id-ordered
+        // list needs to resume from; production's is an opaque DynamoDB key, but a caller only
+        // ever hands it back unread.
+        var ordered = _listings.Values
             .Where(listing => string.Equals(listing.SellerId, sellerId, StringComparison.Ordinal))
             .Where(listing => status is null || listing.Status == status)
             .OrderBy(listing => listing.Id, StringComparer.Ordinal)
-            .Take(limit)
-            .Select(Copy)
+            .Where(listing => cursor is null || string.CompareOrdinal(listing.Id, cursor) > 0)
             .ToList();
 
-        return Task.FromResult(new Page<Listing>(matches, null, matches.Count));
+        var matches = ordered.Take(limit).Select(Copy).ToList();
+        var next = ordered.Count > limit ? matches[^1].Id : null;
+
+        return Task.FromResult(new Page<Listing>(matches, next, matches.Count));
     }
 
     public Task IncrementViewCountAsync(string listingId, CancellationToken ct)
@@ -102,10 +107,43 @@ public sealed class FakeListingRepository : FakeAdapter, IListingRepository
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Stands in for the watchlist's atomic ADD on the listing row, which production applies
+    /// in the same transaction as the saved-item row. Returns <c>false</c> when the listing
+    /// does not exist or, for a decrement, when the count is already zero.
+    /// </summary>
+    public bool TryAdjustWatcherCount(string listingId, long delta)
+    {
+        if (!_listings.TryGetValue(listingId, out var listing) || listing.WatcherCount + delta < 0)
+        {
+            return false;
+        }
+
+        listing.ApplyWatcherCount(listing.WatcherCount + delta);
+        return true;
+    }
+
     public Task<string?> FindSellerUsernameAsync(string listingId, CancellationToken ct)
     {
         ThrowIfFailing();
         return Task.FromResult(SellerUsernames.TryGetValue(listingId, out var username) ? username : null);
+    }
+
+    public Task<int> CountBySellerAsync(string sellerId, ListingStatus status, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        return Task.FromResult(_listings.Values.Count(l => l.SellerId == sellerId && l.Status == status));
+    }
+
+    public Task<IReadOnlyDictionary<string, string>> FindSellerIdsAsync(
+        IReadOnlyCollection<string> listingIds, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        IReadOnlyDictionary<string, string> found = listingIds
+            .Distinct(StringComparer.Ordinal)
+            .Where(_listings.ContainsKey)
+            .ToDictionary(id => id, id => _listings[id].SellerId, StringComparer.Ordinal);
+        return Task.FromResult(found);
     }
 
     private static Listing Copy(Listing listing) => Listing.Rehydrate(
@@ -127,5 +165,9 @@ public sealed class FakeListingRepository : FakeAdapter, IListingRepository
         listing.CreatedAt,
         listing.UpdatedAt,
         listing.PublishedAt,
-        listing.Version);
+        listing.Version,
+        listing.AuctionDurationDays,
+        listing.AuctionReservePrice,
+        listing.AuctionBuyoutPrice,
+        listing.Stock);
 }

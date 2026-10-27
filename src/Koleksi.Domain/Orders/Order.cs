@@ -29,14 +29,35 @@ public sealed class Order
     /// </summary>
     /// <remarks>
     /// Without a deadline, an inattentive buyer strands a seller's money indefinitely.
-    /// Three days is long enough to open and inspect a collectible, short enough that
-    /// sellers can plan around it, and it matches what the order timeline tells the buyer.
+    /// Two days (the owner's rule, shortened from three) is long enough to open and inspect a
+    /// collectible, short enough that sellers can plan around it, and it matches what the order
+    /// timeline tells the buyer. The clock starts when the courier reports the parcel delivered,
+    /// not when it was shipped.
     /// </remarks>
-    public static readonly TimeSpan AutoReleaseAfterDelivery = TimeSpan.FromDays(3);
+    public static readonly TimeSpan AutoReleaseAfterDelivery = TimeSpan.FromDays(2);
+
+    /// <summary>
+    /// How long a seller has to ship a paid order before the buyer may dispute it for not having shipped.
+    /// </summary>
+    /// <remarks>
+    /// Without it a buyer could freeze the escrow, and put a staff case in front of the seller, the moment they
+    /// paid (QA P-04). Three days from payment is the policy default; a dispute on a parcel that has been shipped
+    /// is never held back by it.
+    /// </remarks>
+    public static readonly TimeSpan ShipWindow = TimeSpan.FromDays(3);
 
     /// <summary>How long an unpaid order holds its stock before auto-cancelling.</summary>
     /// <remarks>Mirrors the 15-minute QRIS countdown shown at checkout stage 2.</remarks>
     public static readonly TimeSpan PaymentWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// How long the winner of an auction has to pay, counted from when the auction closed (not from
+    /// when they open checkout), so a winner cannot stretch it by starting late.
+    /// </summary>
+    public static readonly TimeSpan AuctionPaymentWindow = TimeSpan.FromMinutes(30);
+
+    /// <summary>How often a shipped parcel is asked about while it has not been reported delivered.</summary>
+    public static readonly TimeSpan TrackingPollInterval = TimeSpan.FromMinutes(30);
 
     private readonly List<OrderLine> _lines = [];
 
@@ -49,6 +70,7 @@ public sealed class Order
         CourierSelection courier,
         DateTimeOffset createdAt)
     {
+        PaymentDueAt = createdAt + PaymentWindow;
         Id = id;
         OrderNumber = orderNumber;
         BuyerId = buyerId;
@@ -61,7 +83,7 @@ public sealed class Order
 
     public string Id { get; }
 
-    /// <summary>Human-facing reference shown on receipts, e.g. <c>KLK-8F2A41</c>.</summary>
+    /// <summary>Human-facing reference shown on receipts, e.g. <c>KLK-8F2A41QZ</c> (older orders have six characters).</summary>
     public string OrderNumber { get; }
 
     public string BuyerId { get; }
@@ -88,6 +110,35 @@ public sealed class Order
     public DateTimeOffset? DeliveredAt { get; private set; }
     public DateTimeOffset? ReleasedAt { get; private set; }
 
+    /// <summary>
+    /// What this purchase came from. A plain sale that is never paid is just a lapsed reservation; an
+    /// accepted nego offer or an auction win that is never paid is a broken commitment and earns the
+    /// buyer a warning (see <c>AccountStanding</c>).
+    /// </summary>
+    public OrderSource Source { get; private set; } = OrderSource.FixedPrice;
+
+    /// <summary>
+    /// The deal behind a non-sale order: the offer's id for an accepted offer, the listing's id for an
+    /// auction win. It is what makes one broken deal one warning (see <c>AccountStanding</c>), however
+    /// many orders were opened for it. <c>null</c> for a plain sale.
+    /// </summary>
+    public string? SourceReference { get; private set; }
+
+    /// <summary>
+    /// When an unpaid order stops being payable and its stock goes back on sale: fifteen minutes after
+    /// checkout for a sale or an accepted offer, thirty minutes after the close for an auction win.
+    /// Orders stored before this was kept read as created + <see cref="PaymentWindow"/>.
+    /// </summary>
+    public DateTimeOffset PaymentDueAt { get; private set; }
+
+    /// <summary>When the courier was last asked about this parcel, or <c>null</c> if it never has been.</summary>
+    public DateTimeOffset? TrackingCheckedAt { get; private set; }
+
+    /// <summary>When the courier should next be asked about a shipped parcel; <c>null</c> in any other state.</summary>
+    public DateTimeOffset? NextTrackingCheckAt => EscrowState is EscrowState.Shipped or EscrowState.InTransit
+        ? (TrackingCheckedAt ?? ShippedAt) + TrackingPollInterval
+        : null;
+
     /// <summary>Tracking details, present from <see cref="EscrowState.Shipped"/> onwards.</summary>
     public Shipment? Shipment { get; private set; }
 
@@ -108,10 +159,24 @@ public sealed class Order
     /// The platform's commission, deducted from the seller's payout rather than added
     /// to the buyer's total.
     /// </summary>
-    public Money PlatformFee => ItemsTotal.Percent(PlatformFeePercent);
+    public Money PlatformFee => ItemsTotal.Percent(AppliedFeePercent);
 
-    /// <summary>Commission rate, matching the fee breakdown on the sell form.</summary>
+    /// <summary>
+    /// The commission rate in force today, matching the fee breakdown on the sell form. Applied to
+    /// every order created from now on; an existing order keeps the rate it was created with
+    /// (<see cref="AppliedFeePercent"/>).
+    /// </summary>
     public const decimal PlatformFeePercent = 5m;
+
+    /// <summary>
+    /// The commission rate this order was created under, snapshotted so that changing
+    /// <see cref="PlatformFeePercent"/> later cannot rewrite what a past order's seller was owed.
+    /// Orders stored before the snapshot existed have none and read as the current rate.
+    /// </summary>
+    public decimal AppliedFeePercent => FeePercentSnapshot ?? PlatformFeePercent;
+
+    /// <summary>The stored snapshot itself; <c>null</c> on an order that predates it.</summary>
+    public decimal? FeePercentSnapshot { get; private set; }
 
     /// <summary>What the seller receives once escrow releases.</summary>
     public Money SellerPayout => ItemsTotal - PlatformFee;
@@ -132,7 +197,10 @@ public sealed class Order
         IEnumerable<OrderLine> lines,
         ShippingAddress shipTo,
         CourierSelection courier,
-        IClock clock)
+        IClock clock,
+        OrderSource source = OrderSource.FixedPrice,
+        DateTimeOffset? paymentDueAt = null,
+        string? sourceReference = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(buyerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
@@ -154,6 +222,33 @@ public sealed class Order
         var id = EntityId.New(now);
         var order = new Order(id, BuildOrderNumber(id), buyerId, sellerId, shipTo, courier, now);
         order._lines.AddRange(materialised);
+
+        // Money arithmetic is checked, so a total beyond a long would throw OverflowException
+        // (an opaque 500) the first time anything read it. Refused here as a coded domain error
+        // instead, while nothing has been stored or held (QA D-07). Listing prices are capped far
+        // below this; it guards the one path that is not, an auction won at an enormous bid.
+        try
+        {
+            _ = order.GrandTotal;
+        }
+        catch (OverflowException)
+        {
+            throw DomainException.For("order.total_too_large", "The order total is too large.");
+        }
+
+        order.FeePercentSnapshot = PlatformFeePercent;
+        order.Source = source;
+        order.SourceReference = sourceReference;
+        if (paymentDueAt is { } due)
+        {
+            if (due <= now)
+            {
+                throw DomainException.For("order.payment_window_closed", "The time to pay for this purchase has run out.");
+            }
+
+            order.PaymentDueAt = due;
+        }
+
         return order;
     }
 
@@ -173,10 +268,20 @@ public sealed class Order
         DateTimeOffset? shippedAt,
         DateTimeOffset? deliveredAt,
         DateTimeOffset? releasedAt,
-        long version)
+        long version,
+        decimal? platformFeePercent = null,
+        OrderSource source = OrderSource.FixedPrice,
+        DateTimeOffset? paymentDueAt = null,
+        DateTimeOffset? trackingCheckedAt = null,
+        string? sourceReference = null)
     {
         var order = new Order(id, orderNumber, buyerId, sellerId, shipTo, courier, createdAt)
         {
+            FeePercentSnapshot = platformFeePercent,
+            Source = source,
+            SourceReference = sourceReference,
+            PaymentDueAt = paymentDueAt ?? createdAt + PaymentWindow,
+            TrackingCheckedAt = trackingCheckedAt,
             EscrowState = escrowState,
             Shipment = shipment,
             Dispute = dispute,
@@ -267,6 +372,18 @@ public sealed class Order
         _ = clock;
     }
 
+    /// <summary>Notes that the courier was asked and has not delivered yet, so the next question waits its turn.</summary>
+    public void RecordTrackingCheck(IClock clock)
+    {
+        if (EscrowState is not (EscrowState.Shipped or EscrowState.InTransit))
+        {
+            return;
+        }
+
+        TrackingCheckedAt = clock.UtcNow;
+        Version++;
+    }
+
     /// <summary>Records courier-confirmed delivery, starting the auto-release countdown.</summary>
     public void MarkDelivered(IClock clock)
     {
@@ -301,6 +418,15 @@ public sealed class Order
                 "Funds cannot be released while a dispute is open.");
         }
 
+        // The buyer is the authority on their own parcel: confirming receipt releases the money even if
+        // the courier has not reported the delivery (or never will, with no tracking provider). The timed
+        // release is different: it only ever starts from a courier-reported delivery.
+        if (confirmedByBuyer && EscrowState is EscrowState.Shipped or EscrowState.InTransit)
+        {
+            DeliveredAt = clock.UtcNow;
+            EscrowState = EscrowState.Delivered;
+        }
+
         if (EscrowState != EscrowState.Delivered)
         {
             throw DomainException.For(
@@ -320,10 +446,54 @@ public sealed class Order
         Version++;
     }
 
+    /// <summary>
+    /// When a buyer may first dispute an order that has been paid but not shipped (<see cref="ShipWindow"/> after payment);
+    /// <c>null</c> before payment. Once the parcel is shipped a dispute is open at any time.
+    /// </summary>
+    public DateTimeOffset? DisputableFrom => PaidAt + ShipWindow;
+
+    /// <summary>
+    /// Refuses a buyer's dispute on a paid order the seller has not yet had <see cref="ShipWindow"/> to ship. Called where a
+    /// buyer opens a dispute (<c>OpenOrderDisputeHandler</c>); <see cref="OpenDispute"/> itself stays state-only so that the
+    /// rest of the system, and its tests, can still put an order into dispute at any time.
+    /// </summary>
+    /// <exception cref="DomainException"><c>order.dispute_too_early</c>.</exception>
+    public void EnsureDisputeWindowOpen(IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (EscrowState == EscrowState.Paid && DisputableFrom is { } from && clock.UtcNow < from)
+        {
+            throw DomainException.For(
+                "order.dispute_too_early",
+                "The seller still has time to ship this order. You can open a dispute if it is not shipped by then.");
+        }
+    }
+
     /// <summary>Freezes release while the buyer's complaint is reviewed.</summary>
     public void OpenDispute(string reason, string actingBuyerId, IClock clock)
     {
         EnsureBuyer(actingBuyerId);
+
+        var trimmedReason = (reason ?? string.Empty).Trim();
+        if (trimmedReason.Length == 0)
+        {
+            throw DomainException.For("order.dispute_reason_required", "Say what is wrong with the order.");
+        }
+
+        if (trimmedReason.Length > Dispute.MaxReasonLength)
+        {
+            throw DomainException.For(
+                "order.dispute_reason_too_long",
+                $"The reason must be at most {Dispute.MaxReasonLength} characters.");
+        }
+
+        // The first reason is the evidence: a second submission must not overwrite it (nor reset
+        // when the dispute was opened) just because the order is still in the Disputed state.
+        if (EscrowState == EscrowState.Disputed)
+        {
+            throw DomainException.For("order.already_disputed", "A dispute is already open on this order.");
+        }
 
         if (EscrowState == EscrowState.Released)
         {
@@ -337,7 +507,7 @@ public sealed class Order
             throw DomainException.For("order.not_disputable", $"A {EscrowState} order cannot be disputed.");
         }
 
-        Dispute = new Dispute(reason, clock.UtcNow, Resolution: null, ResolvedAt: null);
+        Dispute = new Dispute(trimmedReason, clock.UtcNow, Resolution: null, ResolvedAt: null);
         EscrowState = EscrowState.Disputed;
         Version++;
     }
@@ -380,7 +550,7 @@ public sealed class Order
 
     /// <summary>Whether the unpaid payment window has elapsed.</summary>
     public bool HasPaymentExpired(IClock clock) =>
-        EscrowState == EscrowState.AwaitingPayment && clock.UtcNow > CreatedAt + PaymentWindow;
+        EscrowState == EscrowState.AwaitingPayment && clock.UtcNow > PaymentDueAt;
 
     /// <summary>Confirms the caller is a party to this order, in either role.</summary>
     /// <exception cref="DomainException">The caller is neither buyer nor seller.</exception>
@@ -418,7 +588,29 @@ public sealed class Order
     /// adjacent orders. Deriving from the id keeps the reference short and quotable
     /// without leaking volume.
     /// </remarks>
-    private static string BuildOrderNumber(string id) => $"KLK-{id[^6..]}";
+    private static string BuildOrderNumber(string id) => $"KLK-{id[^OrderNumberLength..]}";
+
+    /// <summary>
+    /// Characters of the id kept in the order number: 8 Crockford base-32 characters are 40 random
+    /// bits (the id's tail is its random part), so a collision needs on the order of a million
+    /// orders rather than the thousands 6 characters (28 to 30 bits) allowed (QA D-13). Numbers
+    /// issued with 6 characters stay valid: nothing parses the length, and lookup is by the whole
+    /// stored string.
+    /// </summary>
+    internal const int OrderNumberLength = 8;
+}
+
+/// <summary>Where an order's price and seller came from.</summary>
+public enum OrderSource
+{
+    /// <summary>The listing's asking price. Walking away from it unpaid is not a violation.</summary>
+    FixedPrice = 0,
+
+    /// <summary>An offer the seller accepted. A deal both sides agreed to: not paying for it is a violation.</summary>
+    AcceptedOffer = 1,
+
+    /// <summary>An auction the buyer won or bought out. Not paying for it is a violation.</summary>
+    AuctionWin = 2,
 }
 
 /// <summary>One line of an order, snapshotted at purchase time.</summary>
@@ -426,7 +618,7 @@ public sealed class Order
 /// <param name="Title">Title as it read at purchase, so a later edit cannot rewrite history.</param>
 /// <param name="PhotoKey">Thumbnail object key at purchase time.</param>
 /// <param name="UnitPrice">Price agreed, which may be an accepted offer rather than the asking price.</param>
-/// <param name="Quantity">Almost always 1 — collectibles are one-of-one.</param>
+/// <param name="Quantity">Units bought. Always 1 for an accepted offer or an auction; a sale may buy several when the seller listed stock.</param>
 public sealed record OrderLine(string ListingId, string Title, string? PhotoKey, Money UnitPrice, int Quantity)
 {
     public Money LineTotal => UnitPrice * Quantity;
@@ -467,6 +659,9 @@ public sealed record Shipment(
     /// </summary>
     public const int MinTrackingNumberLength = 8;
 
+    /// <summary>Longest waybill accepted. Generous for any courier, small enough to bound what is stored.</summary>
+    public const int MaxTrackingNumberLength = 64;
+
     public static Shipment Create(
         string courierCode,
         string trackingNumber,
@@ -478,12 +673,27 @@ public sealed record Shipment(
         ArgumentException.ThrowIfNullOrWhiteSpace(packedParcelPhotoKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(trackingLabelPhotoKey);
 
+        // Two photos, two views of the shipment: one image in both slots is one proof pretending to be two.
+        if (string.Equals(packedParcelPhotoKey, trackingLabelPhotoKey, StringComparison.Ordinal))
+        {
+            throw DomainException.For(
+                "shipment.proof_duplicate",
+                "The packed-parcel photo and the tracking-label photo must be two different photos.");
+        }
+
         var normalised = (trackingNumber ?? string.Empty).Trim().ToUpperInvariant();
         if (normalised.Length < MinTrackingNumberLength)
         {
             throw DomainException.For(
                 "shipment.tracking_too_short",
                 $"A tracking number must be at least {MinTrackingNumberLength} characters.");
+        }
+
+        if (normalised.Length > MaxTrackingNumberLength)
+        {
+            throw DomainException.For(
+                "shipment.tracking_too_long",
+                $"A tracking number must be at most {MaxTrackingNumberLength} characters.");
         }
 
         return new Shipment(courierCode, normalised, packedParcelPhotoKey, trackingLabelPhotoKey, shippedOn);
@@ -495,7 +705,11 @@ public sealed record Dispute(
     string Reason,
     DateTimeOffset OpenedAt,
     DisputeResolution? Resolution,
-    DateTimeOffset? ResolvedAt);
+    DateTimeOffset? ResolvedAt)
+{
+    /// <summary>Longest complaint accepted; bounds what a single order row can grow to.</summary>
+    public const int MaxReasonLength = 1000;
+}
 
 /// <summary>How support ruled on a dispute.</summary>
 public enum DisputeResolution

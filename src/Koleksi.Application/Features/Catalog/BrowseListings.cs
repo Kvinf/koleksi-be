@@ -1,5 +1,6 @@
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Common;
+using Koleksi.Application.Features.Sellers;
 using Koleksi.Domain.Catalog;
 
 namespace Koleksi.Application.Features.Catalog;
@@ -9,7 +10,9 @@ namespace Koleksi.Application.Features.Catalog;
 /// </summary>
 public sealed class BrowseListingsHandler(
     IListingSearchIndex index,
-    ICategoryRepository categories)
+    ICategoryRepository categories,
+    IListingRepository listings,
+    PublicIdentityResolver identities)
 {
     public async Task<BrowseResult> HandleAsync(BrowseRequest request, CancellationToken ct)
     {
@@ -42,14 +45,51 @@ public sealed class BrowseListingsHandler(
         await Task.WhenAll(resultsTask, facetsTask).ConfigureAwait(false);
 
         var counts = await facetsTask.ConfigureAwait(false);
+        var page = await resultsTask.ConfigureAwait(false);
 
         return new BrowseResult(
             Found: true,
-            Page: await resultsTask.ConfigureAwait(false),
+            Page: page with { Items = await WithPublicSellerNamesAsync(page.Items, ct).ConfigureAwait(false) },
             Category: category,
             Categories: allCategories,
             Facets: BuildFacetView(category, counts, query.SelectedFacets),
             AppliedFilters: DescribeAppliedFilters(category, query));
+    }
+
+    /// <summary>
+    /// Replaces the seller name stored in each browse row with the seller's public handle.
+    /// </summary>
+    /// <remarks>
+    /// Rows indexed before the projection carried a seller id have only the sign-in name, which
+    /// for an email account is the email address. Their seller id is read from the listing in one
+    /// batch, so old rows stop leaking without being re-indexed. The stored name is never shown.
+    /// </remarks>
+    private async Task<IReadOnlyList<ListingSummary>> WithPublicSellerNamesAsync(
+        IReadOnlyList<ListingSummary> items, CancellationToken ct)
+    {
+        if (items.Count == 0)
+        {
+            return items;
+        }
+
+        var unknown = items.Where(item => item.SellerId is null).Select(item => item.Id).ToList();
+        var legacy = unknown.Count == 0
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(
+                await listings.FindSellerIdsAsync(unknown, ct).ConfigureAwait(false), StringComparer.Ordinal);
+
+        string? SellerOf(ListingSummary item) => item.SellerId ?? legacy.GetValueOrDefault(item.Id);
+
+        var names = await identities
+            .ResolveManyAsync(items.Select(SellerOf).OfType<string>(), ct).ConfigureAwait(false);
+
+        // A listing whose seller cannot be found at all (deleted while the row lingered) shows no
+        // name rather than the stale one.
+        return [.. items.Select(item => item with
+        {
+            SellerUsername = SellerOf(item) is { } seller ? names[seller].Handle : string.Empty,
+            SellerId = null,
+        })];
     }
 
     /// <summary>

@@ -10,6 +10,9 @@ namespace Koleksi.Domain.Users;
 /// </remarks>
 public readonly record struct BankAccount(string BankName, string AccountNumber, string AccountHolderName)
 {
+    public const int MaxBankNameLength = 60;
+    public const int MaxAccountHolderNameLength = 100;
+
     public static BankAccount Create(string bankName, string accountNumber, string accountHolderName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(bankName);
@@ -21,6 +24,13 @@ public readonly record struct BankAccount(string BankName, string AccountNumber,
         {
             throw DomainException.For(
                 "profile.bank_account_invalid", "Account number must be 6 to 20 digits.");
+        }
+
+        if (bankName.Trim().Length > MaxBankNameLength || accountHolderName.Trim().Length > MaxAccountHolderNameLength)
+        {
+            throw DomainException.For(
+                "profile.bank_account_invalid",
+                $"Bank name is at most {MaxBankNameLength} characters and the holder name at most {MaxAccountHolderNameLength}.");
         }
 
         return new BankAccount(bankName.Trim(), trimmedNumber, accountHolderName.Trim());

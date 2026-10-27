@@ -26,7 +26,15 @@ public sealed class AddToCartHandler(
     /// </remarks>
     public const int MaxItems = 50;
 
-    public async Task<AddToCartResult> HandleAsync(string listingId, CancellationToken ct)
+    public Task<AddToCartResult> HandleAsync(string listingId, CancellationToken ct) =>
+        HandleAsync(listingId, 1, ct);
+
+    /// <summary>
+    /// Adds <paramref name="quantity"/> units of the listing, replacing any quantity already in the
+    /// cart. The number must be within what the seller stocks; whether those units are free right now is
+    /// decided at checkout, where they are actually reserved.
+    /// </summary>
+    public async Task<AddToCartResult> HandleAsync(string listingId, int quantity, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(listingId);
 
@@ -46,13 +54,20 @@ public sealed class AddToCartHandler(
             throw DomainException.For("cart.own_listing", "You cannot add your own listing to your cart.");
         }
 
+        if (quantity < 1 || quantity > Math.Min(listing.Stock, IListingHoldStore.MaxQuantityPerOrder))
+        {
+            throw DomainException.For(
+                "cart.invalid_quantity",
+                $"Choose between 1 and {Math.Min(listing.Stock, IListingHoldStore.MaxQuantityPerOrder)} units.");
+        }
+
         var existing = await cart.ListAsync(buyerId, ct).ConfigureAwait(false);
         if (existing.Count >= MaxItems && !existing.Any(item => item.ListingId == listing.Id))
         {
             throw DomainException.For("cart.limit_reached", $"A cart can hold at most {MaxItems} items.");
         }
 
-        await cart.AddItemAsync(buyerId, listing.Id, clock.UtcNow, ct).ConfigureAwait(false);
+        await cart.AddItemAsync(buyerId, listing.Id, clock.UtcNow, ct, quantity).ConfigureAwait(false);
         return AddToCartResult.Added;
     }
 }

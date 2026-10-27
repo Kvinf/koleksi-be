@@ -84,16 +84,29 @@ internal static class DynamoTable
     private const string BidPrefix = "BID#";
     private const string OfferPrefix = "OFFER#";
     private const string OfferActiveSuffix = "OFFERACTIVE#";
+    private const string ConversationPrefix = "CONV#";
+    private const string MessagePrefix = "MSG#";
     private const string OrderPrefix = "ORDER#";
     private const string OrderNumberPrefix = "ORDERNUM#";
     private const string BrowsePrefix = "BROWSE#";
     private const string FacetPrefix = "FACETS#";
+    private const string SuggestPrefix = "SUGGEST#";
     private const string IdempotencyPrefix = "IDEMPOTENCY#";
     private const string UserPrefix = "USER#";
+    private const string HandlePrefix = "HANDLE#";
+    private const string SellerReviewsPrefix = "REVIEWS#";
+    private const string ReviewSkPrefix = "REVIEW#";
     private const string PhoneOtpPrefix = "PHONEOTP#";
     private const string EmailOtpPrefix = "EMAILOTP#";
+    private const string OtpThrottlePrefix = "OTPTHROTTLE#";
     private const string CartPrefix = "CART#";
     private const string CartItemPrefix = "ITEM#";
+    private const string ListingHoldPrefix = "HOLD#";
+    private const string PaymentOrphanPrefix = "PAYORPHAN#";
+    private const string ShippingClaimPrefix = "SHIPCLAIM#";
+    private const string RealtimeTicketPrefix = "WS#TICKET#";
+    private const string RealtimeTopicPrefix = "WS#TOPIC#";
+    private const string RealtimeConnectionSkPrefix = "CONN#";
 
     /// <summary>
     /// Width used when encoding a price into a sort key.
@@ -191,9 +204,55 @@ internal static class DynamoTable
     /// </remarks>
     public static string OfferActiveSk(string buyerId) => OfferActiveSuffix + Require(buyerId);
 
+    /// <summary>The prefix shared by every active-offer pointer in a listing's partition.</summary>
+    public static string OfferActiveSkPrefix() => OfferActiveSuffix;
+
+    // ─── Conversation ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Partition holding a conversation's summary row and every message in it.
+    /// </summary>
+    /// <remarks>
+    /// One partition so a message and the summary it advances are written in a single
+    /// transaction, and a thread is one <c>Query</c>. A thread is bounded in practice — two
+    /// people, one listing — so the partition cannot grow into a hot key.
+    /// </remarks>
+    public static string ConversationPk(string conversationId) => ConversationPrefix + Require(conversationId);
+
+    public static string ConversationMetaSk() => MetaSuffix;
+
+    /// <summary>
+    /// Type-prefix for a conversation's row in <see cref="SellerIndex"/>/<see cref="BuyerIndex"/>.
+    /// </summary>
+    /// <remarks>
+    /// Unlike offers and orders, the timestamp that follows is the time of the <em>latest</em>
+    /// message, rewritten on every send, so the inbox sorts by recent activity rather than by
+    /// when the thread began.
+    /// </remarks>
+    public static string ConversationIndexPrefix() => ConversationPrefix;
+
+    /// <summary>
+    /// Sort key for one message. Ids are time-ordered, so the key sorts chronologically with
+    /// no separate timestamp, the same technique bids use — but only to the millisecond, so
+    /// two messages from the same millisecond may swap places. That is harmless when a thread
+    /// is rendered whole and fatal for a "newer than id X" cursor, which is why reads always
+    /// fetch the latest page rather than resume from one.
+    /// </summary>
+    public static string MessageSk(string messageId) => MessagePrefix + Require(messageId);
+
+    public static string MessageSkPrefix() => MessagePrefix;
+
     // ─── Order ──────────────────────────────────────────────────────────────────
 
     public static string OrderPk(string orderId) => OrderPrefix + Require(orderId);
+
+    /// <summary>A payout owed to a seller for a released order: one item per order.</summary>
+    public static string PayoutPk(string orderId) => "PAYOUT#" + Require(orderId);
+
+    public static string PayoutMetaSk() => "META";
+
+    /// <summary>Sort-key prefix that keeps a seller's payouts apart from their orders and listings on the seller index.</summary>
+    public static string PayoutIndexPrefix() => "PAYOUT#";
 
     public static string OrderMetaSk() => MetaSuffix;
 
@@ -211,6 +270,32 @@ internal static class DynamoTable
     public static string OrderNumberPk(string orderNumber) => OrderNumberPrefix + Require(orderNumber);
 
     public static string OrderNumberSk() => MetaSuffix;
+
+    /// <summary>
+    /// Partition, in the sparse <see cref="AuctionEndIndex"/>, of orders that are waiting on a
+    /// clock: one state ("AwaitingPayment" or "Delivered") and one shard.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The scheduled sweep needs "unpaid orders whose window has elapsed" and "delivered orders
+    /// whose confirmation window has closed" without a table scan. The close-time index already
+    /// exists, is sparse, projects ALL attributes and is sharded by a stable hash, so orders ride
+    /// it under a prefix no auction partition (<c>AUCTION#…</c>) can share. A query names its
+    /// partition exactly, so neither kind of row can come back from the other's query.
+    /// </para>
+    /// <para>
+    /// The shard is <see cref="ShardOf"/> of the order id, so every write of one order lands in the
+    /// same shard (FNV-1a is stable across processes, see there). The state is part of the
+    /// partition so a state change moves the entry rather than leaving a stale one: the order item
+    /// is always written whole, and keys it does not carry any more are removed by that write.
+    /// </para>
+    /// </remarks>
+    public static string OrderDuePkValue(string state, int shard) =>
+        $"ORDERDUE#{Require(state)}#{shard.ToString(CultureInfo.InvariantCulture)}";
+
+    /// <summary>Due-time sort key for an order: the instant, then the id, exactly like <see cref="AuctionEndSkValue"/>.</summary>
+    public static string OrderDueSkValue(DateTimeOffset dueAt, string orderId) =>
+        $"{FormatInstant(dueAt)}#{Require(orderId)}";
 
     // ─── Browse indexes ─────────────────────────────────────────────────────────
 
@@ -304,6 +389,26 @@ internal static class DynamoTable
     public static string FacetSkValue(string facetKey, string value) =>
         $"{Require(facetKey)}#{Require(value)}";
 
+    // ─── Search suggestions ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// How many leading characters of a word pick its partition.
+    /// </summary>
+    /// <remarks>
+    /// Two, so a visitor who has typed two letters already reaches every word that begins with them
+    /// in a single Query. The rows in a partition are then read with <c>begins_with</c> on the sort
+    /// key and a hard item limit, so a common prefix costs the same as a rare one.
+    /// </remarks>
+    public const int SuggestBucketLength = 2;
+
+    /// <summary>Partition for words beginning with the first <see cref="SuggestBucketLength"/> characters of <paramref name="word"/>.</summary>
+    public static string SuggestPkValue(string word) =>
+        SuggestPrefix + Require(word)[..Math.Min(SuggestBucketLength, word.Length)];
+
+    /// <summary>Sort key: the word, then the listing id, so one word's rows sit together and newest ids sort last.</summary>
+    public static string SuggestSkValue(string word, string listingId) =>
+        $"{Require(word)}#{Require(listingId)}";
+
     // ─── Idempotency ────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -322,35 +427,114 @@ internal static class DynamoTable
     /// <summary>Partition for one account's profile — keyed by Cognito subject, not a minted id.</summary>
     public static string UserPk(string userId) => UserPrefix + Require(userId);
 
+    /// <summary>The account id inside a <see cref="UserPk"/> partition key: the reverse of <c>UserPk</c>.</summary>
+    public static string UserIdFromPk(string pk)
+    {
+        ArgumentNullException.ThrowIfNull(pk);
+
+        return pk.StartsWith(UserPrefix, StringComparison.Ordinal) && pk.Length > UserPrefix.Length
+            ? pk[UserPrefix.Length..]
+            : throw new ArgumentException("Not a user partition key.", nameof(pk));
+    }
+
     public static string ProfileSk() => "#PROFILE";
+
+    // ─── Public profile and handles ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Sort key of an account's public identity, in the same partition as its private profile.
+    /// </summary>
+    /// <remarks>
+    /// A separate item from <see cref="ProfileSk"/> on purpose: the private profile is replaced
+    /// wholesale on every save, and the public identity (handle, display name) must not ride on
+    /// that write or be one added attribute from being served to strangers.
+    /// </remarks>
+    public static string PublicProfileSk() => "#PUBLIC";
+
+    /// <summary>
+    /// The row that makes a handle belong to exactly one account.
+    /// </summary>
+    /// <remarks>
+    /// Written with <c>attribute_not_exists</c> in the same transaction as the account's own
+    /// public-profile item, so a handle can be claimed by only one account and an account cannot
+    /// hold two. The handle must already be in its canonical lower-case form: the key has one
+    /// spelling, and normalisation is <c>PublicHandle.TryNormalize</c>'s job, not this builder's.
+    /// </remarks>
+    public static string HandlePk(string handle) => HandlePrefix + Require(handle);
+
+    public static string HandleSk() => MetaSuffix;
+
+    // ─── Reviews ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The review for one order: the item that makes "one review per order" a condition on a write.
+    /// </summary>
+    /// <remarks>
+    /// Shares the order's partition (sort key <c>#REVIEW</c>, beside the order's <c>#META</c>) so
+    /// it needs no key of its own, and carries no index keys, so it never shows up in an order list.
+    /// </remarks>
+    public static string OrderReviewPk(string orderId) => OrderPk(orderId);
+
+    public static string OrderReviewSk() => "#REVIEW";
+
+    /// <summary>Partition holding everything about one seller's reviews: the feed and the counters.</summary>
+    public static string SellerReviewsPk(string sellerId) => SellerReviewsPrefix + Require(sellerId);
+
+    /// <summary>
+    /// A review's entry in its seller's feed. Review ids are time-ordered, so a descending query
+    /// on the sort key is newest-first with no index.
+    /// </summary>
+    public static string SellerReviewSk(string reviewId) => ReviewSkPrefix + Require(reviewId);
+
+    public static string SellerReviewSkPrefix() => ReviewSkPrefix;
+
+    /// <summary>The seller's rating counters, atomically incremented with every review.</summary>
+    public static string SellerReviewStatsSk() => "#STATS";
 
     // ─── Phone OTP ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Partition for one phone number's outstanding verification challenge.
+    /// Partition for one account's outstanding verification challenge to one phone number.
     /// </summary>
     /// <remarks>
-    /// Keyed by the phone number rather than the account: the number is what a code is
-    /// sent to, and the challenge has to be findable by that number alone at verify time
-    /// before it is known to belong to any particular account's profile.
+    /// Keyed by the account as well as the number: a challenge belongs to whoever asked for it,
+    /// so a stranger submitting guesses for someone else's number touches (and can exhaust) only
+    /// their own challenge, never the victim's pending code.
     /// </remarks>
-    public static string PhoneOtpPkValue(string normalizedPhone) => PhoneOtpPrefix + Require(normalizedPhone);
+    public static string PhoneOtpPkValue(string ownerId, string normalizedPhone) =>
+        $"{PhoneOtpPrefix}{Require(ownerId)}#{Require(normalizedPhone)}";
 
     public static string PhoneOtpSk() => "#CHALLENGE";
 
     // ─── Email OTP ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Partition for one email address's outstanding verification challenge.
+    /// Partition for one account's outstanding verification challenge to one email address.
     /// </summary>
     /// <remarks>
-    /// Same reasoning as <see cref="PhoneOtpPkValue"/>: keyed by the address the code was
-    /// sent to, findable at verify time before it is known to belong to any account.
+    /// Same reasoning as <see cref="PhoneOtpPkValue"/>: keyed by the account as well as the address.
     /// Normalised to lowercase, unlike the phone number, because email addresses are
     /// case-insensitive by convention and a reader who typed their address in Title Case
     /// once must still be able to verify it.
     /// </remarks>
-    public static string EmailOtpPkValue(string normalizedEmail) => EmailOtpPrefix + Require(normalizedEmail);
+    public static string EmailOtpPkValue(string ownerId, string normalizedEmail) =>
+        $"{EmailOtpPrefix}{Require(ownerId)}#{Require(normalizedEmail)}";
+
+    // ─── Verification-code throttle ─────────────────────────────────────────────
+
+    /// <summary>Partition holding one account's verification-code request counters.</summary>
+    public static string OtpThrottlePk(string userId) => OtpThrottlePrefix + Require(userId);
+
+    /// <summary>
+    /// The "wait before asking this account for another code to this destination" marker.
+    /// The destination is hashed by the caller: it can be an email address or a phone number,
+    /// neither of which belongs in a key.
+    /// </summary>
+    public static string OtpCooldownSk(string destinationHash) => "#COOLDOWN#" + Require(destinationHash);
+
+    /// <summary>The count of codes requested in one clock hour, e.g. <c>2026030109</c>.</summary>
+    public static string OtpHourSk(DateTimeOffset at) =>
+        "#HOUR#" + at.UtcDateTime.ToString("yyyyMMddHH", CultureInfo.InvariantCulture);
 
     public static string EmailOtpSk() => "#CHALLENGE";
 
@@ -363,7 +547,122 @@ internal static class DynamoTable
 
     public static string CartItemSkPrefix() => CartItemPrefix;
 
+    // ─── Watchlist ──────────────────────────────────────────────────────────────
+
+    /// <summary>Partition holding one person's saved listings — one row per listing.</summary>
+    /// <remarks>
+    /// A different prefix from <see cref="CartPk"/> on purpose: the two lists are unrelated, and
+    /// sharing a partition would make a cart read page through saved listings it never wanted.
+    /// </remarks>
+    public static string WatchlistPk(string userId) => "WATCH#" + Require(userId);
+
+    public static string WatchlistItemSk(string listingId) => "LISTING#" + Require(listingId);
+
+    public static string WatchlistItemSkPrefix() => "LISTING#";
+
     // ─── Encoding ───────────────────────────────────────────────────────────────
+
+    // ─── Listing holds ──────────────────────────────────────────────────────────
+
+    /// <summary>The short reservation on a listing while a buyer's order awaits payment.</summary>
+    public static string ListingHoldPk(string listingId) => ListingHoldPrefix + Require(listingId);
+
+    // Admin dispute handling (Milestone 1). Case notes, the "waiting for information" marker and the refund hang off the order's own
+    // key space or a partition of their own; none of them carries an index attribute, so none appears in a seller's or buyer's list.
+
+    /// <summary>The state names the dispute queues use inside the sparse sweep index (<see cref="OrderDuePkValue"/>). The sweeps ask only for their own states, so these are invisible to them.</summary>
+    public const string DisputedQueueState = "Disputed";
+
+    public const string DisputeResolvedQueueState = "DisputeResolved";
+
+    private const string DisputeNotePrefix = "DISPUTENOTE#";
+
+    /// <summary>A case note, in the order's partition, sorted by its time-ordered id.</summary>
+    public static string DisputeNoteSk(string noteId) => DisputeNotePrefix + Require(noteId);
+
+    public static string DisputeNoteSkPrefix() => DisputeNotePrefix;
+
+    /// <summary>One small row per order that has an information request staff are waiting on; deleted when the case is ruled on.</summary>
+    public static string DisputeInfoSk() => "DISPUTEINFO";
+
+    /// <summary>The refund for an order: one per order, written with the ruling.</summary>
+    public static string RefundPk(string orderId) => "REFUND#" + Require(orderId);
+
+    public static string RefundSk() => "META";
+
+    /// <summary>A person's pending notices (see <c>OrderNotice</c>): nothing delivers them yet.</summary>
+    public static string NoticePk(string userId) => "NOTICE#" + Require(userId);
+
+    public static string NoticeSk(DateTimeOffset at, string noticeId) => $"{FormatInstant(at)}#{Require(noticeId)}";
+
+    /// <summary>One year's holidays. A query on this partition is the whole holiday list for the year.</summary>
+    public static string HolidayPk(int year) => "HOLIDAY#" + year.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The holiday's own sort key: its date, <c>yyyy-MM-dd</c>, so a year reads in date order.</summary>
+    public static string HolidaySk(string isoDate) => Require(isoDate);
+
+    /// <summary>Marks a year as seeded, so a holiday staff removed is never put back. Starts with "#", so it never matches a date.</summary>
+    public static string HolidaySeededSk() => "#SEEDED";
+
+    // A person's disputes: one tiny pointer row per (person, order), written in the same transaction that gives the order its dispute,
+    // so "every dispute this person is in, as buyer or seller" is one Query on one partition instead of paging all their orders.
+    private const string UserDisputePrefix = "UDISPUTE#";
+
+    public static string UserDisputePk(string userId) => UserDisputePrefix + Require(userId);
+
+    /// <summary>The order id itself, so a person's pointers sort in order-id (creation) order.</summary>
+    public static string UserDisputeSk(string orderId) => Require(orderId);
+
+    // Admin audit log. Every audit entry is stored three times, in the same transaction: once in a partition
+    // per calendar month (the unfiltered view), once under the acting staff member, once under the thing
+    // acted on. A filtered view is then one Query on one partition, never a Scan and never a new index. All
+    // three start with "AUDIT#", which is what the admin Lambda's IAM policy matches (dynamodb:LeadingKeys)
+    // to deny any update or delete of an audit row.
+
+    /// <summary>The prefix every audit partition key starts with, and the one IAM denies updates and deletes on.</summary>
+    public const string AuditPrefix = "AUDIT#";
+
+    /// <summary>Partition for all entries written in the UTC calendar month of <paramref name="at"/>.</summary>
+    public static string AuditMonthPk(DateTimeOffset at) =>
+        AuditMonthPk(at.UtcDateTime.ToString("yyyyMM", CultureInfo.InvariantCulture));
+
+    public static string AuditMonthPk(string yyyyMm) => AuditPrefix + "ALL#" + Require(yyyyMm);
+
+    /// <summary>Partition for every entry written by one staff member.</summary>
+    public static string AuditActorPk(string actorId) => AuditPrefix + "ACTOR#" + Require(actorId);
+
+    /// <summary>Partition for every entry about one target (a user, a listing, an order...).</summary>
+    public static string AuditTargetPk(string targetType, string targetId) =>
+        $"{AuditPrefix}TARGET#{Require(targetType)}#{Require(targetId)}";
+
+    /// <summary>Sort key: the instant, then the id, so a descending query is newest first and two entries in one tick never collide.</summary>
+    public static string AuditSk(DateTimeOffset at, string entryId) => $"{FormatInstant(at)}#{Require(entryId)}";
+
+    /// <summary>Partition of the orphaned-payment records for one order number. See <c>IPaymentOrphanStore</c>.</summary>
+    public static string PaymentOrphanPk(string orderNumber) => PaymentOrphanPrefix + Require(orderNumber);
+
+    /// <summary>
+    /// Partition of one shipping claim: a proof photo key or a waybill, which may back only one order. See
+    /// <c>IShippingClaimStore</c>. <paramref name="kind"/> keeps a photo key and a waybill from ever colliding.
+    /// </summary>
+    public static string ShippingClaimPk(string kind, string value) =>
+        $"{ShippingClaimPrefix}{Require(kind)}#{Require(value)}";
+
+    // ─── Realtime ───────────────────────────────────────────────────────────────
+    //
+    // The WebSocket connection registry. Written by two parties — this service (tickets) and
+    // the realtime Lambda in koleksi-infra/lambda/realtime (connections and subscriptions) —
+    // so these three shapes are mirrored there and must change together.
+
+    /// <summary>A connect ticket. Keyed by the ticket's hash, never the ticket itself.</summary>
+    public static string RealtimeTicketPk(string ticketHash) => RealtimeTicketPrefix + Require(ticketHash);
+
+    /// <summary>Everyone subscribed to a topic: one <see cref="RealtimeConnectionSk"/> row each.</summary>
+    public static string RealtimeTopicPk(string topic) => RealtimeTopicPrefix + Require(topic);
+
+    public static string RealtimeConnectionSk(string connectionId) => RealtimeConnectionSkPrefix + Require(connectionId);
+
+    public static string RealtimeConnectionSkPrefixValue() => RealtimeConnectionSkPrefix;
 
     /// <summary>Round-trip UTC ISO-8601. Sorts lexicographically in instant order.</summary>
     public static string FormatInstant(DateTimeOffset value) =>

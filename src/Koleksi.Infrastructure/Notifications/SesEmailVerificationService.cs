@@ -1,9 +1,6 @@
-using Amazon.DynamoDBv2;
-using Amazon.DynamoDBv2.Model;
 using Amazon.SimpleEmailV2;
 using Amazon.SimpleEmailV2.Model;
 using Koleksi.Application.Abstractions;
-using Koleksi.Domain.Common;
 using Koleksi.Infrastructure.Persistence;
 using Microsoft.Extensions.Logging;
 
@@ -16,47 +13,30 @@ namespace Koleksi.Infrastructure.Notifications;
 /// <remarks>
 /// The same shape as <see cref="SnsPhoneVerificationService"/>, and for the same reason:
 /// SES only sends a message, it does not remember what it sent, so this type is the whole
-/// of that missing half — it mints the code, stores it with a TTL, and is the only thing
-/// that ever reads it back. One challenge per address, not per session: a request always
-/// overwrites whatever was outstanding.
+/// of that missing half — it mints the code, stores it with a TTL (see
+/// <see cref="DynamoOtpChallengeStore"/>), and is the only thing that ever reads it back.
+/// One challenge per account and address, not per session: a request always overwrites
+/// whatever that account had outstanding for the address.
 /// </remarks>
 internal sealed partial class SesEmailVerificationService(
     IAmazonSimpleEmailServiceV2 ses,
-    IAmazonDynamoDB dynamo,
-    DynamoOptions dynamoOptions,
+    DynamoOtpChallengeStore challenges,
     EmailOptions emailOptions,
-    IClock clock,
     ILogger<SesEmailVerificationService> logger) : IEmailVerificationService
 {
-    private const string CodeAttr = "code";
-    private const string TtlAttr = "expiresAt";
-
     private static readonly TimeSpan CodeLifetime = TimeSpan.FromMinutes(5);
 
-    public async Task<string?> RequestCodeAsync(string email, CancellationToken ct)
+    public async Task<string?> RequestCodeAsync(string ownerId, string email, CancellationToken ct)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(email);
 
         var normalized = email.Trim().ToLowerInvariant();
         var code = GenerateCode();
-        var expiresAt = clock.UtcNow + CodeLifetime;
 
-        // Unconditional put: replaces any still-outstanding challenge for this address,
-        // per the "one challenge per address" reasoning above.
-        await dynamo.PutItemAsync(
-            new PutItemRequest
-            {
-                TableName = dynamoOptions.TableName,
-                Item = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
-                {
-                    [DynamoTable.Pk] = Attr.S(DynamoTable.EmailOtpPkValue(normalized)),
-                    [DynamoTable.Sk] = Attr.S(DynamoTable.EmailOtpSk()),
-                    [DynamoTable.EntityType] = Attr.S("EmailOtp"),
-                    [CodeAttr] = Attr.S(code),
-                    [TtlAttr] = Attr.N(DynamoTable.ToTtl(expiresAt)),
-                },
-            },
-            ct).ConfigureAwait(false);
+        await challenges.StoreAsync(
+            DynamoTable.EmailOtpPkValue(ownerId, normalized), DynamoTable.EmailOtpSk(), "EmailOtp",
+            code, CodeLifetime, ct).ConfigureAwait(false);
 
         try
         {
@@ -95,42 +75,14 @@ internal sealed partial class SesEmailVerificationService(
         return null;
     }
 
-    public async Task<bool> VerifyCodeAsync(string email, string code, CancellationToken ct)
+    public Task<bool> VerifyCodeAsync(string ownerId, string email, string code, CancellationToken ct)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(email);
         ArgumentException.ThrowIfNullOrWhiteSpace(code);
 
-        var normalized = email.Trim().ToLowerInvariant();
-
-        // One-shot: deleted on every verify attempt regardless of outcome, so a captured
-        // code cannot be replayed even within its five-minute window.
-        var response = await dynamo.DeleteItemAsync(
-            new DeleteItemRequest
-            {
-                TableName = dynamoOptions.TableName,
-                Key = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
-                {
-                    [DynamoTable.Pk] = Attr.S(DynamoTable.EmailOtpPkValue(normalized)),
-                    [DynamoTable.Sk] = Attr.S(DynamoTable.EmailOtpSk()),
-                },
-                ReturnValues = ReturnValue.ALL_OLD,
-            },
-            ct).ConfigureAwait(false);
-
-        if (response.Attributes is not { Count: > 0 } item)
-        {
-            return false;
-        }
-
-        var expiresAt = DateTimeOffset.FromUnixTimeSeconds(item.GetLong(TtlAttr));
-        if (expiresAt < clock.UtcNow)
-        {
-            return false;
-        }
-
-        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-            System.Text.Encoding.UTF8.GetBytes(item.GetString(CodeAttr)),
-            System.Text.Encoding.UTF8.GetBytes(code));
+        return challenges.VerifyAsync(
+            DynamoTable.EmailOtpPkValue(ownerId, email.Trim().ToLowerInvariant()), DynamoTable.EmailOtpSk(), code, ct);
     }
 
     private static string GenerateCode() =>

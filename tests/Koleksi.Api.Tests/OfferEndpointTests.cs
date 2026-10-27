@@ -63,8 +63,9 @@ public sealed class OfferEndpointTests(KoleksiApiFactory factory) : IClassFixtur
 
         using var response = await client.PostAsync($"/api/offers/{offer.Id}/accept", null);
 
-        response.StatusCode.ShouldBe(HttpStatusCode.Forbidden);
-        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("offer.forbidden");
+        // The same answer a missing id gets (QA S-08), so the route is no oracle for which ids exist.
+        response.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("offer.not_found");
     }
 
     [Fact]

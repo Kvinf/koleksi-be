@@ -63,6 +63,13 @@ public sealed class FakeOrderRepository : FakeAdapter, IOrderRepository
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<Order>> ListDisputedForUserAsync(string userId, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        return Task.FromResult<IReadOnlyList<Order>>(
+            [.. _orders.Values.Where(o => o.Dispute is not null && (o.BuyerId == userId || o.SellerId == userId)).OrderByDescending(o => o.CreatedAt).Select(Copy)]);
+    }
+
     public Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct)
     {
         ThrowIfFailing();
@@ -82,8 +89,46 @@ public sealed class FakeOrderRepository : FakeAdapter, IOrderRepository
     public Task<IReadOnlyList<Order>> ListDueForAutoReleaseAsync(DateTimeOffset asOf, int limit, CancellationToken ct)
     {
         ThrowIfFailing();
+        // Mirrors the sparse index: only Delivered orders carry an entry, due at AutoReleaseAt.
         IReadOnlyList<Order> due = _orders.Values
-            .Where(o => o.AutoReleaseAt is { } at && at <= asOf)
+            .Where(o => o.EscrowState == EscrowState.Delivered && o.AutoReleaseAt is { } at && at <= asOf)
+            .OrderBy(o => o.AutoReleaseAt)
+            .Take(limit).Select(Copy).ToList();
+        return Task.FromResult(due);
+    }
+
+    public Task<IReadOnlyList<Order>> ListPaymentExpiredAsync(DateTimeOffset asOf, int limit, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        // Mirrors the sparse index: only AwaitingPayment orders carry an entry, due when the window ends.
+        IReadOnlyList<Order> due = _orders.Values
+            .Where(o => o.EscrowState == EscrowState.AwaitingPayment && o.PaymentDueAt <= asOf)
+            .OrderBy(o => o.PaymentDueAt)
+            .Take(limit).Select(Copy).ToList();
+        return Task.FromResult(due);
+    }
+
+    /// <summary>The payouts written together with released orders (the transactional half of release).</summary>
+    public FakePayoutRepository Payouts { get; } = new();
+
+    public async Task UpdateWithPayoutAsync(Order order, long expectedVersion, Payout payout, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        // Both or neither: the payout is added only if the order write passes its version check.
+        await UpdateAsync(order, expectedVersion, ct);
+        Payouts.AddForRelease(payout);
+    }
+
+    public Task<IReadOnlyList<Order>> ListDueForTrackingAsync(DateTimeOffset asOf, int limit, CancellationToken ct)
+    {
+        ThrowIfFailing();
+
+        // Mirrors the sparse index: only shipped parcels carry an entry, due at NextTrackingCheckAt.
+        IReadOnlyList<Order> due = _orders.Values
+            .Where(o => o.NextTrackingCheckAt is { } at && at <= asOf)
+            .OrderBy(o => o.NextTrackingCheckAt)
             .Take(limit).Select(Copy).ToList();
         return Task.FromResult(due);
     }
@@ -91,5 +136,6 @@ public sealed class FakeOrderRepository : FakeAdapter, IOrderRepository
     private static Order Copy(Order order) => Order.Rehydrate(
         order.Id, order.OrderNumber, order.BuyerId, order.SellerId, order.Lines, order.ShipTo, order.Courier,
         order.EscrowState, order.Shipment, order.Dispute, order.CreatedAt, order.PaidAt, order.ShippedAt,
-        order.DeliveredAt, order.ReleasedAt, order.Version);
+        order.DeliveredAt, order.ReleasedAt, order.Version, order.FeePercentSnapshot,
+        order.Source, order.PaymentDueAt, order.TrackingCheckedAt, order.SourceReference);
 }

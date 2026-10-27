@@ -23,9 +23,14 @@ namespace Koleksi.Infrastructure.IntegrationTests;
 /// </remarks>
 internal static class DynamoLocal
 {
-    public const string ServiceUrl = "http://localhost:8000";
+    /// <summary>
+    /// Where DynamoDB Local listens. Port 8000 unless <c>KOLEKSI_TEST_DYNAMODB_URL</c> says otherwise, so a run can use a throwaway container
+    /// (a long-lived one gets slower with every run) without touching the one that holds a developer's local table.
+    /// </summary>
+    public static readonly string ServiceUrl =
+        Environment.GetEnvironmentVariable("KOLEKSI_TEST_DYNAMODB_URL") is { Length: > 0 } url ? url : "http://localhost:8000";
 
-    public const string SkipReason =
+    public static readonly string SkipReason =
         "DynamoDB Local is not reachable at " + ServiceUrl + ". Start it with: docker run -d "
         + "--name koleksi-dynamodb-local -p 8000:8000 amazon/dynamodb-local:latest "
         + "-jar DynamoDBLocal.jar -inMemory -sharedDb";

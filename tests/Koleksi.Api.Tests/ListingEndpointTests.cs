@@ -13,7 +13,8 @@ namespace Koleksi.Api.Tests;
 /// </summary>
 public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixture<KoleksiApiFactory>
 {
-    private static object BaseRequest(bool publish, bool withPhoto, string format = "FixedPrice") => new
+    private static object BaseRequest(
+        bool publish, bool withPhoto, string ownerId = TestData.SellerId, string format = "FixedPrice") => new
     {
         categoryId = TestData.CardsCategoryId,
         title = "PSA 10 Charizard Base Set Holo 1999",
@@ -23,7 +24,7 @@ public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixt
         city = "Bandung",
         description = "Kondisi mulus, kartu asli.",
         photos = withPhoto
-            ? new[] { new { storageKey = "listings/test-photo.jpg", width = 1200, height = 1200 } }
+            ? new[] { new { storageKey = TestData.PhotoKey(ownerId, "test-photo"), width = 1200, height = 1200 } }
             : Array.Empty<object>(),
         publish,
     };
@@ -52,7 +53,7 @@ public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixt
     {
         using var client = factory.CreateClientAs("01JLISTUSER0000000000PUB1", "seller.publish");
 
-        using var response = await client.PostAsJsonAsync("/api/listings", BaseRequest(publish: true, withPhoto: true));
+        using var response = await client.PostAsJsonAsync("/api/listings", BaseRequest(publish: true, withPhoto: true, ownerId: "01JLISTUSER0000000000PUB1"));
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
         var body = await response.ReadJsonAsync();
@@ -83,7 +84,7 @@ public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixt
             condition = "PSA 10",
             city = "Bandung",
             description = "Lelang kartu langka.",
-            photos = new[] { new { storageKey = "listings/auction-photo.jpg", width = 1200, height = 1200 } },
+            photos = new[] { new { storageKey = TestData.PhotoKey("01JLISTUSER0000000000AUCT", "auction-photo"), width = 1200, height = 1200 } },
             auctionDurationDays = 3,
             publish = true,
         };
@@ -111,6 +112,52 @@ public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixt
     }
 
     [Fact]
+    public async Task A_refused_publish_leaves_nothing_behind()
+    {
+        // Found by QA: the listing used to be saved as a draft first and published second, so every
+        // refused publish left a draft in the seller's dashboard.
+        const string sellerId = "01JLISTUSER0000000000NODR";
+        using var client = factory.CreateClientAs(sellerId, "seller.nodraft");
+
+        using var response = await client.PostAsJsonAsync("/api/listings", BaseRequest(publish: true, withPhoto: false));
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await factory.Listings.CountBySellerAsync(sellerId, ListingStatus.Draft, CancellationToken.None)).ShouldBe(0);
+        (await factory.Listings.CountBySellerAsync(sellerId, ListingStatus.Active, CancellationToken.None)).ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task An_auction_whose_terms_are_refused_leaves_nothing_behind()
+    {
+        const string sellerId = "01JLISTUSER0000000000BADT";
+        using var client = factory.CreateClientAs(sellerId, "seller.badterms");
+
+        var request = new
+        {
+            categoryId = TestData.CardsCategoryId,
+            title = "PSA 10 Charizard Base Set Holo 1999",
+            priceRupiah = 1_000_000,
+            format = "Auction",
+            condition = "PSA 10",
+            city = "Bandung",
+            description = "Lelang kartu langka.",
+            photos = new[] { new { storageKey = TestData.PhotoKey(sellerId, "terms-photo"), width = 1200, height = 1200 } },
+            auctionDurationDays = 3,
+
+            // A reserve above the buyout breaks an auction rule, so the publish must be refused.
+            reservePriceRupiah = 5_000_000,
+            buyoutPriceRupiah = 2_000_000,
+            publish = true,
+        };
+
+        using var response = await client.PostAsJsonAsync("/api/listings", request);
+
+        ((int)response.StatusCode).ShouldBeInRange(400, 499);
+        (await factory.Listings.CountBySellerAsync(sellerId, ListingStatus.Draft, CancellationToken.None)).ShouldBe(0);
+        (await factory.Listings.CountBySellerAsync(sellerId, ListingStatus.Active, CancellationToken.None)).ShouldBe(0);
+    }
+
+    [Fact]
     public async Task A_photo_that_was_never_uploaded_is_refused()
     {
         factory.Media.NextVerifyUploadedResult = false;
@@ -119,7 +166,7 @@ public sealed class ListingEndpointTests(KoleksiApiFactory factory) : IClassFixt
         {
             using var client = factory.CreateClientAs("01JLISTUSER0000000000BADP", "seller.badphoto");
 
-            using var response = await client.PostAsJsonAsync("/api/listings", BaseRequest(publish: false, withPhoto: true));
+            using var response = await client.PostAsJsonAsync("/api/listings", BaseRequest(publish: false, withPhoto: true, ownerId: "01JLISTUSER0000000000BADP"));
 
             // Same coarse mapping as every other domain-rule violation in this codebase —
             // DomainExceptionHandler maps a plain DomainException to 409, not 400.

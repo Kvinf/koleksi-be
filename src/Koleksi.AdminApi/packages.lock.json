@@ -1,0 +1,272 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "Amazon.Lambda.AspNetCoreServer.Hosting": {
+        "type": "Direct",
+        "requested": "[2.2.0, )",
+        "resolved": "2.2.0",
+        "contentHash": "BvmDCUU19/MICEt9DooF5LldytwlWXGMFYD56TrWbcJc4+GNNdOe0+fRumjDMfKq/0DqBE+4pcydqq0lO0Olyg==",
+        "dependencies": {
+          "Amazon.Lambda.APIGatewayEvents": "3.0.0",
+          "Amazon.Lambda.AspNetCoreServer": "10.2.0",
+          "Amazon.Lambda.Core": "3.3.0",
+          "Amazon.Lambda.RuntimeSupport": "2.1.3"
+        }
+      },
+      "Microsoft.AspNetCore.Authentication.JwtBearer": {
+        "type": "Direct",
+        "requested": "[10.0.11, )",
+        "resolved": "10.0.11",
+        "contentHash": "Dy9yElSej0rVQL8LBpCLatWTKXNH6h6VBVFmGndTCf1Wge0jSvH9U8mml6ddVDAQ089q1/fDYlhyukHSgx8unQ==",
+        "dependencies": {
+          "Microsoft.IdentityModel.Protocols.OpenIdConnect": "8.19.2"
+        }
+      },
+      "Amazon.Extensions.CognitoAuthentication": {
+        "type": "Transitive",
+        "resolved": "3.1.5",
+        "contentHash": "hTN+qpEWb/oE5tCTcopzP7NvlmHcr7ymVfbCAu9Tk05MUNfNIOPngheahF4J7GQGIJ4NIrqN5wZvKrQ80JsTzg==",
+        "dependencies": {
+          "AWSSDK.CognitoIdentity": "4.0.2.18",
+          "AWSSDK.CognitoIdentityProvider": "4.0.6.2"
+        }
+      },
+      "Amazon.Lambda.APIGatewayEvents": {
+        "type": "Transitive",
+        "resolved": "3.0.0",
+        "contentHash": "1JxlUCqIps7p9FLRfFrgaLCVqgg2J39ZOmZDmV/R1LMwb2eT4/glaKwhxC3r01HeDsozk1jUe1KYRGgzxJaVXg=="
+      },
+      "Amazon.Lambda.ApplicationLoadBalancerEvents": {
+        "type": "Transitive",
+        "resolved": "3.0.0",
+        "contentHash": "lUiZhNxherASNgbZysdFEj37VlyO7BH2z4iOwFpRtfLGq/v/dkVqt3rBAVvrxfPBRGi6SbSb/bHTV4bhPo5tSg=="
+      },
+      "Amazon.Lambda.AspNetCoreServer": {
+        "type": "Transitive",
+        "resolved": "10.2.0",
+        "contentHash": "hLf/d0xSYlsIDAfM8dQzIlaPAso0GFfmRxt1tCXf7HYVE3iI7F/uSIDeXBmUKtU3D5IBoqSbHt/UpZ1FxqLlXg==",
+        "dependencies": {
+          "Amazon.Lambda.APIGatewayEvents": "3.0.0",
+          "Amazon.Lambda.ApplicationLoadBalancerEvents": "3.0.0",
+          "Amazon.Lambda.Core": "3.3.0",
+          "Amazon.Lambda.Logging.AspNetCore": "5.0.0",
+          "Amazon.Lambda.Serialization.SystemTextJson": "3.0.0"
+        }
+      },
+      "Amazon.Lambda.Core": {
+        "type": "Transitive",
+        "resolved": "3.3.0",
+        "contentHash": "CZKlX8ZDMi6aKPo5lPAjmsJFDXNJHX00aiiYeRQOEszP8cjx6qklBvTPj4qpr4dlp3YYQjmB87CqAiWV7vk2fA=="
+      },
+      "Amazon.Lambda.Logging.AspNetCore": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "vfqHBHPvsIvaAGeBnFSRSCThHoqXWqy7S/R6/Aldn4/FmHEp872D0WcJgFac/D0h0GnbHqyfFkjmBEpi85vOog==",
+        "dependencies": {
+          "Amazon.Lambda.Core": "3.0.0"
+        }
+      },
+      "Amazon.Lambda.RuntimeSupport": {
+        "type": "Transitive",
+        "resolved": "2.1.3",
+        "contentHash": "bBOA9nh2q3DillDYJJmFDnlJDTRWmmJTAopCsd7RaLDdYds3AWuREFSFuDulzBACeU20Icm2OPmtDaGWapRIEg==",
+        "dependencies": {
+          "Amazon.Lambda.Core": "3.3.0",
+          "SnapshotRestore.Registry": "1.0.2"
+        }
+      },
+      "Amazon.Lambda.Serialization.SystemTextJson": {
+        "type": "Transitive",
+        "resolved": "3.0.0",
+        "contentHash": "8lKS2w8Ww+Kq41mRmedL3lYLVr+UE0tzN2FwOigxKe+hzDbWJIMXZwVHwf53RsdFsYZlaTmW4WHE56W/1Fk3Hg==",
+        "dependencies": {
+          "Amazon.Lambda.Core": "3.0.0"
+        }
+      },
+      "AWSSDK.ApiGatewayManagementApi": {
+        "type": "Transitive",
+        "resolved": "4.0.100.16",
+        "contentHash": "GsvfEdSUyKR/s6SGXpZphwOjVbREOHOGwiwCl95BNP3zdZFkuXKt2r2w1T0WheH0smMViZdeD1SjHiwSscRD7w==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.102.8, 5.0.0)"
+        }
+      },
+      "AWSSDK.CognitoIdentity": {
+        "type": "Transitive",
+        "resolved": "4.0.2.18",
+        "contentHash": "EOdvsWGU/t/2vXtGVuxFhx2xYha/PcL8ptQBYLGWRBYTRvBrOmaI2jnkRRAjWj0OZbB9hKnrrpDyvvms/GYrwQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.3.17, 5.0.0)",
+          "AWSSDK.SecurityToken": "[4.0.5.12, 5.0.0)"
+        }
+      },
+      "AWSSDK.CognitoIdentityProvider": {
+        "type": "Transitive",
+        "resolved": "4.0.103.2",
+        "contentHash": "Mh5cF7D6LLpdiu0lPzd39caK5UDbcN84qjeIaFoAYSha6r89q/BCWjKZ7DWpWRFeMxa/knmmTXd3Ydlm/pi4YA==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.101, 5.0.0)"
+        }
+      },
+      "AWSSDK.Core": {
+        "type": "Transitive",
+        "resolved": "4.0.102.8",
+        "contentHash": "90B9Skhl+ORbtWNXrrmGdGhGvAfZiPmZafRYrB/xHelZjePIwPvXioqz9UiiF1vo21eDLzTnXh5EC4RjbNWsFQ=="
+      },
+      "AWSSDK.DynamoDBv2": {
+        "type": "Transitive",
+        "resolved": "4.0.103.1",
+        "contentHash": "lWjDWid4uPdgi1b5dARsvvsFDUmgJf+uAnInD3yGSdNXZoEPd2nDZfVTKFxi9ny4BdlmV4znmVFf2uQoqPPIfg==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.101, 5.0.0)"
+        }
+      },
+      "AWSSDK.Extensions.NETCore.Setup": {
+        "type": "Transitive",
+        "resolved": "4.0.100.8",
+        "contentHash": "l3HGANvMpuN/plXLH+8VSP3J1fOovi8E/PRl+3qPKB9jmr/74a3C0SlVA7lNen/fx9HuiMnlkqzijFgEj0lKag==",
+        "dependencies": {
+          "AWSSDK.Core": "4.0.101"
+        }
+      },
+      "AWSSDK.S3": {
+        "type": "Transitive",
+        "resolved": "4.0.102.1",
+        "contentHash": "zGP3FW4D0wfbmYxoOWgNoPcwoA8E+kWH6KezOBPiLpAOi3l4cygFF15jiWdma6R7D+M9qu3DzdpWq/VlyIJX+Q==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.101, 5.0.0)"
+        }
+      },
+      "AWSSDK.SecretsManager": {
+        "type": "Transitive",
+        "resolved": "4.0.100.8",
+        "contentHash": "mLM4RgOQfaxkDgmHWnwWpEer/10AI5w0R6FC6VMX8JninfACEVXT4J/OARA403dOA1D7t/dQf36mLL4M3hiADQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.101, 5.0.0)"
+        }
+      },
+      "AWSSDK.SecurityToken": {
+        "type": "Transitive",
+        "resolved": "4.0.5.12",
+        "contentHash": "vzqtwlYuaLhioO/kr1KorEIOvyOFkaqYkUGy3luPbHkFX9nOIjsgywOUSP0blRhwhL7UQiluqiPD+cQg1Msjzw==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.3.17, 5.0.0)"
+        }
+      },
+      "AWSSDK.SimpleEmailV2": {
+        "type": "Transitive",
+        "resolved": "4.0.101",
+        "contentHash": "ctxJ/MmiYh02NU+UTdd9i0QB2pSZM7FSAy7wZZB+hCcj7JIc+IpTSJcYwWyjLBfNZeyud9YooDQ148/jFCpu4Q==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.100.6, 5.0.0)"
+        }
+      },
+      "AWSSDK.SimpleNotificationService": {
+        "type": "Transitive",
+        "resolved": "4.0.100.9",
+        "contentHash": "cEv+H+AVmd/LjxJX1gYDapsQ0BMExES4n0k9plqG8FHkod2RbxMVejVMAYp04bPMQF+yhrt9NP85yHfr2cGDAQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.0.101.1, 5.0.0)"
+        }
+      },
+      "FluentValidation": {
+        "type": "Transitive",
+        "resolved": "12.1.1",
+        "contentHash": "EPpkIe1yh1a0OXyC100oOA8WMbZvqUu5plwhvYcb7oSELfyUZzfxV48BLhvs3kKo4NwG7MGLNgy1RJiYtT8Dpw=="
+      },
+      "Microsoft.Bcl.Cryptography": {
+        "type": "Transitive",
+        "resolved": "10.0.2",
+        "contentHash": "LG9Yll3B5aNpxv0+D47g6LiOiKBIlodhcHdQwcYzo8VeexFLGqx5ymetmA2aBRyo9cCcWsQWrFsdbsr8LvmWDw=="
+      },
+      "Microsoft.IdentityModel.Abstractions": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "HJbo/lnSfNHUfphPRT910poQc4T2/9+8svFLvzuaYHGAOJ2Tu+oEDqpX0BVP3BJ4OuUM1kylEKyaiX2fCAK3Cw=="
+      },
+      "Microsoft.IdentityModel.JsonWebTokens": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "ui3fuBT4fs8kdKfBthI4NzLYIBIneEVS8UrL1JVBzAn80UiKmngBBi0BEByE7n/9c+EElcfFlCMFFTqpkBSLNA==",
+        "dependencies": {
+          "Microsoft.IdentityModel.Tokens": "8.19.2"
+        }
+      },
+      "Microsoft.IdentityModel.Logging": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "r5YLDIxGOnkVJHrqXv/iD1FM1CgGrQOdriXuvuWvTPmKbnGANhEysq9XKmN6IHjf2a+9bAGEpnoRBsAQlvJU5w==",
+        "dependencies": {
+          "Microsoft.IdentityModel.Abstractions": "8.19.2"
+        }
+      },
+      "Microsoft.IdentityModel.Protocols": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "sGxSsSrZXNmca6D+jHH2rVRyo2nNRd/g4H9CFbPmLLq0xgoH1U0orLWE5minfijw7+zq49tBs7txenbfAErRoQ==",
+        "dependencies": {
+          "Microsoft.IdentityModel.Tokens": "8.19.2"
+        }
+      },
+      "Microsoft.IdentityModel.Protocols.OpenIdConnect": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "1XOcyY36cVymzE3qKdzKaUEZ4Pzt7ZpSa14JZoPPK1NLFUkQDs85TCqpV6XDo0YjFXj6nVK00AfOHppjghjhtw==",
+        "dependencies": {
+          "Microsoft.IdentityModel.Protocols": "8.19.2",
+          "System.IdentityModel.Tokens.Jwt": "8.19.2"
+        }
+      },
+      "Microsoft.IdentityModel.Tokens": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "GtPC1S02uH1gOO4fQ+zRysIicKmEXaYFP8PIkdJYXqMyruYhopre4ozVHp0XiDSA0+GJvOZH9prxCPvgBMg4Ww==",
+        "dependencies": {
+          "Microsoft.Bcl.Cryptography": "10.0.2",
+          "Microsoft.IdentityModel.Logging": "8.19.2"
+        }
+      },
+      "SnapshotRestore.Registry": {
+        "type": "Transitive",
+        "resolved": "1.0.2",
+        "contentHash": "clcAZGAb8sbtIuynOPiZkpHLdSb3RGxHJjSPyecgRh55fFY0KynqA7GEtrVL/sAUgO9jvC0IMhPXBRcJuFWrAA=="
+      },
+      "System.IdentityModel.Tokens.Jwt": {
+        "type": "Transitive",
+        "resolved": "8.19.2",
+        "contentHash": "gqhDC/icByKEutygpr+OFgAmjwTVowyzFjWB8K0q1ww8uFj5a1BQNL+QvijUl9uhq4p8OdDwcAIrjVC+eC9FVA==",
+        "dependencies": {
+          "Microsoft.IdentityModel.JsonWebTokens": "8.19.2",
+          "Microsoft.IdentityModel.Tokens": "8.19.2"
+        }
+      },
+      "koleksi.application": {
+        "type": "Project",
+        "dependencies": {
+          "FluentValidation": "[12.1.1, )",
+          "Koleksi.Domain": "[1.0.0, )"
+        }
+      },
+      "koleksi.domain": {
+        "type": "Project"
+      },
+      "koleksi.infrastructure": {
+        "type": "Project",
+        "dependencies": {
+          "AWSSDK.ApiGatewayManagementApi": "[4.0.100.16, )",
+          "AWSSDK.CognitoIdentityProvider": "[4.0.103.2, )",
+          "AWSSDK.DynamoDBv2": "[4.0.103.1, )",
+          "AWSSDK.Extensions.NETCore.Setup": "[4.0.100.8, )",
+          "AWSSDK.S3": "[4.0.102.1, )",
+          "AWSSDK.SecretsManager": "[4.0.100.8, )",
+          "AWSSDK.SimpleEmailV2": "[4.0.101, )",
+          "AWSSDK.SimpleNotificationService": "[4.0.100.9, )",
+          "Amazon.Extensions.CognitoAuthentication": "[3.1.5, )",
+          "Koleksi.Application": "[1.0.0, )"
+        }
+      }
+    },
+    "net10.0/linux-arm64": {}
+  }
+}
