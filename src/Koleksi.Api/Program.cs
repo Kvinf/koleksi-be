@@ -492,6 +492,9 @@ if (settings.Security.HasInternalSecret)
 
 app.UseExceptionHandler();
 app.UseSecurityHeaders();
+
+// Before anything reads a body: a request larger than any this API accepts is refused here (413).
+app.UseMiddleware<RequestBodyLimitMiddleware>();
 app.UseCors(CorsPolicies.Frontend);
 
 #if DEBUG
@@ -507,6 +510,9 @@ app.UseAuthorization();
 // A banned account cannot start anything new (it can still read, sign out and finish paid orders).
 app.UseMiddleware<BannedAccountMiddleware>();
 app.UseRateLimiter();
+
+// An id that cannot be one of ours is a 404 here, not a DynamoDB key error further in.
+app.UseMiddleware<WellFormedIdMiddleware>();
 app.UseOutputCache();
 
 if (app.Environment.IsDevelopment())
@@ -532,6 +538,7 @@ app.MapRealtimeEndpoints();
 app.MapOrderEndpoints();
 app.MapCartEndpoints();
 app.MapPayoutEndpoints();
+app.MapCaseEndpoints();
 app.MapSellerEndpoints();
 app.MapReviewEndpoints();
 app.MapWatchlistEndpoints();

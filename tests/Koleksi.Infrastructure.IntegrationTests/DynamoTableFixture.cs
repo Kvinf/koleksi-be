@@ -44,6 +44,10 @@ public sealed class DynamoTableFixture : IAsyncLifetime
 
     public IConversationRepository Conversations { get; private set; } = null!;
 
+    public IShippingClaimStore ShippingClaims { get; private set; } = null!;
+
+    public IPayoutRepository Payouts { get; private set; } = null!;
+
     public IPublicProfileRepository PublicProfiles { get; private set; } = null!;
 
     public IReviewRepository Reviews { get; private set; } = null!;
@@ -96,6 +100,8 @@ public sealed class DynamoTableFixture : IAsyncLifetime
         Offers = new DynamoOfferRepository(_client, options);
         Orders = new DynamoOrderRepository(_client, options);
         Conversations = new DynamoConversationRepository(_client, options);
+        ShippingClaims = new DynamoShippingClaimStore(_client, options);
+        Payouts = new DynamoPayoutRepository(_client, options);
         PublicProfiles = new DynamoPublicProfileRepository(_client, options);
         Reviews = new DynamoReviewRepository(_client, options);
         Idempotency = new DynamoIdempotencyStore(_client, options, Clock);

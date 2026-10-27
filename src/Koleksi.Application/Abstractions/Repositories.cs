@@ -19,6 +19,12 @@ namespace Koleksi.Application.Abstractions;
 /// </remarks>
 public sealed class ConcurrencyConflictException(string message) : Exception(message);
 
+/// <summary>
+/// Raised when a page cursor the caller sent is not one the store can resume from (forged, edited, or from
+/// another query). A bad request from the caller, not a fault in the service.
+/// </summary>
+public sealed class InvalidCursorException(string message, Exception inner) : ArgumentException(message, inner);
+
 /// <summary>Reads and writes listings.</summary>
 public interface IListingRepository
 {
@@ -237,6 +243,16 @@ public interface IOrderRepository
     /// </summary>
     /// <exception cref="ConcurrencyConflictException">The order changed since it was read, or its payout already exists.</exception>
     Task UpdateWithPayoutAsync(Order order, long expectedVersion, Payout payout, CancellationToken ct);
+
+    /// <summary>
+    /// Every order that has (or had) a dispute and has this person on either side, in any state, newest order first.
+    /// </summary>
+    /// <remarks>
+    /// Answered from a pointer row written with the dispute (a query on one partition, then batched gets of exactly those orders),
+    /// never by paging the person's whole order history or scanning. A dispute opened before the pointers existed is found only once
+    /// the backfill (<see cref="IOrderSweepBackfill"/>) has run.
+    /// </remarks>
+    Task<IReadOnlyList<Order>> ListDisputedForUserAsync(string userId, CancellationToken ct);
 
     Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct);
 

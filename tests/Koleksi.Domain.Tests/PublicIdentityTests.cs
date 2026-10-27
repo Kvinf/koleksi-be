@@ -43,6 +43,45 @@ public sealed class PublicIdentityTests
     public void A_reserved_handle_or_one_that_poses_as_the_platform_is_refused(string raw) =>
         PublicHandle.TryNormalize(raw, out _).ShouldBe("handle.reserved");
 
+    // Look-alike spellings (QA P-05): digits and symbols standing in for letters, and separators dropped.
+    [Theory]
+    [InlineData("k0leksi")]
+    [InlineData("k0leks1")]
+    [InlineData("ko1eksi")]
+    [InlineData("ko-leksi")]
+    [InlineData("k_o_l_e_k_s_i")]
+    [InlineData("4dmin")]
+    [InlineData("4dm1n")]
+    [InlineData("adm1n")]
+    [InlineData("ad-min")]
+    [InlineData("5upport")]
+    [InlineData("st4ff")]
+    [InlineData("t0k0")]
+    [InlineData("0fficial")]
+    public void A_look_alike_of_a_reserved_handle_is_refused_too(string raw) =>
+        PublicHandle.TryNormalize(raw, out _).ShouldBe("handle.reserved");
+
+    [Theory]
+    [InlineData("k0leksi fan")]
+    [InlineData("K0leksi Official")]
+    [InlineData("4dmin Toko")]
+    [InlineData("Toko 5upport")]
+    [InlineData("St4ff Koleksi")]
+    public void A_look_alike_display_name_that_poses_as_the_platform_is_refused(string raw) =>
+        PublicDisplayName.TryNormalize(raw, out _).ShouldBe("profile.display_name_invalid");
+
+    [Theory]
+    [InlineData("budi99")]
+    [InlineData("kartu-kolektor99")]
+    [InlineData("a1b")]
+    [InlineData("tokoku")]
+    [InlineData("gunpla-4-life")]
+    public void Ordinary_handles_with_digits_and_hyphens_are_still_accepted(string raw)
+    {
+        // "tokoku" and the rest contain a reserved word only as part of something longer, which has always been allowed.
+        PublicHandle.TryNormalize(raw, out _).ShouldBeNull();
+    }
+
     [Fact]
     public void A_generated_handle_is_itself_a_valid_canonical_handle_and_is_not_constant()
     {

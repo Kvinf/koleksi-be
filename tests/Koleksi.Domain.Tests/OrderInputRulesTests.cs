@@ -109,4 +109,46 @@ public sealed class OrderInputRulesTests
         Shipment.Create("jne", new string('9', Shipment.MaxTrackingNumberLength), "p/a", "p/b", shippedOn)
             .TrackingNumber.Length.ShouldBe(Shipment.MaxTrackingNumberLength);
     }
+
+    [Fact]
+    public void A_paid_order_cannot_be_disputed_for_not_shipping_until_the_ship_window_has_passed()
+    {
+        var clock = TestClock.AtEpoch();
+        var order = PaidOrder(clock);
+
+        order.DisputableFrom.ShouldBe(clock.UtcNow + Order.ShipWindow);
+
+        Should.Throw<DomainException>(() => order.EnsureDisputeWindowOpen(clock))
+            .Code.ShouldBe("order.dispute_too_early");
+
+        clock.Advance(Order.ShipWindow - TimeSpan.FromSeconds(1));
+        Should.Throw<DomainException>(() => order.EnsureDisputeWindowOpen(clock));
+
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Should.NotThrow(() => order.EnsureDisputeWindowOpen(clock));
+    }
+
+    [Fact]
+    public void Once_shipped_the_window_no_longer_applies()
+    {
+        var clock = TestClock.AtEpoch();
+        var order = PaidOrder(clock);
+        order.MarkShipped(
+            Shipment.Create("jne", "JX1234567890", "p/packed.jpg", "p/label.jpg", new DateOnly(2026, 1, 1)), Seller, clock);
+
+        Should.NotThrow(() => order.EnsureDisputeWindowOpen(clock));
+    }
+
+    [Fact]
+    public void One_photo_cannot_be_both_the_parcel_proof_and_the_label_proof()
+    {
+        var shippedOn = new DateOnly(2026, 1, 1);
+
+        Should.Throw<DomainException>(() => Shipment.Create("jne", "JX1234567890", "p/same.jpg", "p/same.jpg", shippedOn))
+            .Code.ShouldBe("shipment.proof_duplicate");
+
+        // Keys are compared exactly: the store's keys are case-sensitive.
+        Shipment.Create("jne", "JX1234567890", "p/same.jpg", "p/SAME.jpg", shippedOn)
+            .PackedParcelPhotoKey.ShouldBe("p/same.jpg");
+    }
 }

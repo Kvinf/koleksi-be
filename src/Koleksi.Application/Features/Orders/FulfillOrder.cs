@@ -10,6 +10,7 @@ namespace Koleksi.Application.Features.Orders;
 public sealed partial class MarkOrderShippedHandler(
     IOrderRepository orders,
     IMediaStorage media,
+    IShippingClaimStore claims,
     IDeliveryTracker tracker,
     ICurrentUser currentUser,
     IClock clock,
@@ -61,6 +62,21 @@ public sealed partial class MarkOrderShippedHandler(
         {
             throw DomainException.For(
                 "shipment.proof_not_uploaded", "Upload both proof photos for this shipment before marking it shipped.");
+        }
+
+        // The same photos or waybill cannot back a second order: the proof is the evidence in a dispute, and a seller who
+        // uploads one set once could otherwise "ship" every order with it. Claimed after the uploads are known to be
+        // real (so a refused request claims nothing) and before the save; a retry for this same order passes.
+        var clash = await claims.TryClaimAsync(
+            order.Id, shipment.CourierCode, shipment.TrackingNumber,
+            [shipment.PackedParcelPhotoKey, shipment.TrackingLabelPhotoKey], ct).ConfigureAwait(false);
+        if (clash is { } reused)
+        {
+            throw reused == ShippingClaimConflict.TrackingReused
+                ? DomainException.For(
+                    "shipment.tracking_reused", "This tracking number is already used on another order.")
+                : DomainException.For(
+                    "shipment.proof_reused", "These photos were already used as proof for another order. Take new photos of this parcel.");
         }
 
         await orders.UpdateAsync(order, expectedVersion, ct).ConfigureAwait(false);
@@ -142,6 +158,12 @@ public sealed class OpenOrderDisputeHandler(IOrderRepository orders, ICurrentUse
                 && !string.Equals(order.SellerId, buyerId, StringComparison.Ordinal)))
         {
             return FulfillOrderOutcome.NotFound;
+        }
+
+        // Only the buyer may open one; the party check inside OpenDispute gives the seller their own refusal first.
+        if (string.Equals(order.BuyerId, buyerId, StringComparison.Ordinal))
+        {
+            order.EnsureDisputeWindowOpen(clock);
         }
 
         var expectedVersion = order.Version;

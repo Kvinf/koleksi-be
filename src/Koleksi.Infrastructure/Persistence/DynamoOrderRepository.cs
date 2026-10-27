@@ -104,22 +104,47 @@ internal sealed partial class DynamoOrderRepository(IAmazonDynamoDB dynamo, Dyna
     {
         ArgumentNullException.ThrowIfNull(order);
 
+        var condition = "#v = :expected";
+        var names = new Dictionary<string, string>(StringComparer.Ordinal) { ["#v"] = OrderItem.VersionAttribute };
+        var values = new Dictionary<string, AttributeValue>(StringComparer.Ordinal) { [":expected"] = Attr.N(expectedVersion) };
+
         try
         {
-            await dynamo.PutItemAsync(
-                new PutItemRequest
+            if (order.Dispute is null)
+            {
+                await dynamo.PutItemAsync(
+                    new PutItemRequest
+                    {
+                        TableName = options.TableName,
+                        Item = OrderItem.ToItem(order),
+                        ConditionExpression = condition,
+                        ExpressionAttributeNames = names,
+                        ExpressionAttributeValues = values,
+                    },
+                    ct).ConfigureAwait(false);
+                return;
+            }
+
+            // The order has a dispute: its two pointer rows go in the same transaction, so there is never a dispute a person cannot
+            // find or a pointer to one that does not exist. Writing them again on a later update is harmless (same item).
+            await dynamo.TransactWriteItemsAsync(
+                new TransactWriteItemsRequest
                 {
-                    TableName = options.TableName,
-                    Item = OrderItem.ToItem(order),
-                    ConditionExpression = "#v = :expected",
-                    ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
-                    {
-                        ["#v"] = OrderItem.VersionAttribute,
-                    },
-                    ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
-                    {
-                        [":expected"] = Attr.N(expectedVersion),
-                    },
+                    TransactItems =
+                    [
+                        new TransactWriteItem
+                        {
+                            Put = new Put
+                            {
+                                TableName = options.TableName,
+                                Item = OrderItem.ToItem(order),
+                                ConditionExpression = condition,
+                                ExpressionAttributeNames = names,
+                                ExpressionAttributeValues = values,
+                            },
+                        },
+                        .. DisputePointers(order).Select(pointer => new TransactWriteItem { Put = new Put { TableName = options.TableName, Item = pointer } }),
+                    ],
                 },
                 ct).ConfigureAwait(false);
         }
@@ -127,6 +152,77 @@ internal sealed partial class DynamoOrderRepository(IAmazonDynamoDB dynamo, Dyna
         {
             throw new ConcurrencyConflictException($"Order '{order.Id}' changed since it was read.");
         }
+        catch (TransactionCanceledException cancelled) when (DynamoTransactionConflicts.IsConflict(cancelled))
+        {
+            throw new ConcurrencyConflictException($"Order '{order.Id}' changed since it was read.");
+        }
+    }
+
+    /// <summary>The pointer rows that make a dispute findable from each person in it: one for the buyer, one for the seller.</summary>
+    internal static IEnumerable<Dictionary<string, AttributeValue>> DisputePointers(Order order)
+    {
+        foreach (var userId in new[] { order.BuyerId, order.SellerId })
+        {
+            yield return new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+            {
+                [DynamoTable.Pk] = Attr.S(DynamoTable.UserDisputePk(userId)),
+                [DynamoTable.Sk] = Attr.S(DynamoTable.UserDisputeSk(order.Id)),
+                [DynamoTable.EntityType] = Attr.S("DisputeRef"),
+                ["orderId"] = Attr.S(order.Id),
+            };
+        }
+    }
+
+    /// <summary>The most pointers read for one person. A stop against a runaway cursor, far above any account.</summary>
+    private const int DisputePointerCeiling = 5_000;
+
+    private const int BatchGetLimit = 100;
+
+    public async Task<IReadOnlyList<Order>> ListDisputedForUserAsync(string userId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
+
+        var orderIds = new List<string>();
+        Dictionary<string, AttributeValue>? start = null;
+        do
+        {
+            var response = await dynamo.QueryAsync(
+                new QueryRequest
+                {
+                    TableName = options.TableName,
+                    KeyConditionExpression = "#pk = :pk",
+                    ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal) { ["#pk"] = DynamoTable.Pk },
+                    ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                    {
+                        [":pk"] = Attr.S(DynamoTable.UserDisputePk(userId)),
+                    },
+                    ExclusiveStartKey = start,
+                },
+                ct).ConfigureAwait(false);
+
+            orderIds.AddRange((response.Items ?? []).Select(item => item.GetString("orderId")));
+            start = response.LastEvaluatedKey is { Count: > 0 } key && orderIds.Count < DisputePointerCeiling ? key : null;
+        }
+        while (start is not null);
+
+        var found = new List<Order>(orderIds.Count);
+        foreach (var chunk in orderIds.Distinct(StringComparer.Ordinal).Chunk(BatchGetLimit))
+        {
+            var request = new Dictionary<string, KeysAndAttributes>(StringComparer.Ordinal)
+            {
+                [options.TableName] = new KeysAndAttributes { Keys = [.. chunk.Select(KeyOf)] },
+            };
+
+            // BatchGetItem may answer part of a request; the rest comes back as UnprocessedKeys. Bounded, so it cannot spin.
+            for (var attempt = 0; attempt < 5 && request.Count > 0; attempt++)
+            {
+                var response = await dynamo.BatchGetItemAsync(new BatchGetItemRequest { RequestItems = request }, ct).ConfigureAwait(false);
+                found.AddRange((response.Responses?.GetValueOrDefault(options.TableName) ?? []).Select(OrderItem.ToDomain));
+                request = response.UnprocessedKeys is { Count: > 0 } rest ? rest : [];
+            }
+        }
+
+        return [.. found.OrderByDescending(order => order.CreatedAt).ThenBy(order => order.Id, StringComparer.Ordinal)];
     }
 
     public async Task UpdateWithPayoutAsync(Order order, long expectedVersion, Payout payout, CancellationToken ct)
@@ -267,7 +363,7 @@ internal sealed partial class DynamoOrderRepository(IAmazonDynamoDB dynamo, Dyna
         string indexName, string pkAttribute, string pkValue, string skAttribute,
         string? cursor, int limit, CancellationToken ct)
     {
-        var response = await dynamo.QueryAsync(
+        var response = await dynamo.QueryPageAsync(
             new QueryRequest
             {
                 TableName = options.TableName,

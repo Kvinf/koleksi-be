@@ -239,7 +239,7 @@ internal sealed class DynamoOfferRepository(IAmazonDynamoDB dynamo, DynamoOption
         string indexName, string pkAttribute, string pkValue, string skAttribute,
         string? cursor, int limit, CancellationToken ct)
     {
-        var response = await dynamo.QueryAsync(
+        var response = await dynamo.QueryPageAsync(
             new QueryRequest
             {
                 TableName = options.TableName,

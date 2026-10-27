@@ -56,6 +56,9 @@ public sealed class KoleksiOptions
 
     public SecurityOptions Security { get; init; } = new();
 
+    /// <summary>Built-but-off product features. See <see cref="FeaturesOptions"/>.</summary>
+    public FeaturesOptions Features { get; init; } = new();
+
     /// <summary>
     /// Fails fast on a configuration that cannot serve traffic safely in a deployed stage.
     /// </summary>

@@ -83,7 +83,7 @@ public sealed class PublicProfileAndReviewRepositoryTests : DynamoTestBase
     }
 
     [DynamoLocalFact]
-    public async Task Renaming_moves_the_claim_and_frees_the_old_handle()
+    public async Task Renaming_moves_the_claim_and_reserves_the_old_handle_for_its_owner()
     {
         await Table.PublicProfiles.CreateAsync(ProfileFor(Seller, "budi"), Ct);
         var profile = (await Table.PublicProfiles.FindByUserAsync(Seller, Ct))!;
@@ -96,8 +96,15 @@ public sealed class PublicProfileAndReviewRepositoryTests : DynamoTestBase
         (await Table.PublicProfiles.FindByHandleAsync("budi", Ct)).ShouldBeNull();
         (await Table.PublicProfiles.FindByHandleAsync("budi-baru", Ct))!.DisplayName.ShouldBe("Toko Budi");
 
-        // The freed handle can be claimed by someone else.
-        (await Table.PublicProfiles.CreateAsync(ProfileFor(Buyer, "budi"), Ct)).ShouldBe(PublicProfileWriteResult.Written);
+        // The old handle no longer resolves to a page, but it is held back (QA D-10): nobody else
+        // can take the old shop URL while the reservation lasts.
+        (await Table.PublicProfiles.CreateAsync(ProfileFor(Buyer, "budi"), Ct)).ShouldBe(PublicProfileWriteResult.HandleTaken);
+
+        // Once the reservation has lapsed, anyone can claim it.
+        var afterLapse = new FixedClock(Fixtures.Clock.UtcNow + PublicProfile.HandleReservationPeriod + TimeSpan.FromDays(1));
+        var latecomer = PublicProfile.Create(Buyer, "budi", afterLapse.UtcNow, afterLapse);
+        (await Table.PublicProfiles.CreateAsync(latecomer, Ct)).ShouldBe(PublicProfileWriteResult.Written);
+        (await Table.PublicProfiles.FindByHandleAsync("budi", Ct))!.UserId.ShouldBe(Buyer);
     }
 
     [DynamoLocalFact]

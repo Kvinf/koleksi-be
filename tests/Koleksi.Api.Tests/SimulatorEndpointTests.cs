@@ -98,7 +98,7 @@ public sealed class SimulatorEndpointTests(DevelopmentApiFactory factory) : ICla
 
         using var bySeller = await sellerClient.PostAsync($"/api/dev/simulator/orders/{order.Id}/payment", null);
         using var byStranger = await stranger.PostAsync($"/api/dev/simulator/orders/{order.Id}/payment", null);
-        using var missing = await stranger.PostAsync($"/api/dev/simulator/orders/{NewId()}/payment", null);
+        using var missing = await stranger.PostAsync($"/api/dev/simulator/orders/{EntityId.New()}/payment", null);
 
         bySeller.StatusCode.ShouldBe(HttpStatusCode.NotFound);
         byStranger.StatusCode.ShouldBe(HttpStatusCode.NotFound);

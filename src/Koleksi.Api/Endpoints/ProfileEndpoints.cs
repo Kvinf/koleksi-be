@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Infrastructure;
 using Koleksi.Application.Features.Orders;
 using Koleksi.Application.Features.Standing;
 using Koleksi.Domain.Common;
@@ -221,10 +222,16 @@ internal static class ProfileEndpoints
         IMediaStorage media,
         IIdempotencyStore idempotency,
         IClock clock,
+        FeaturesOptions features,
         HttpRequest http,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        if (!features.IdVerificationEnabled)
+        {
+            return Results.NotFound(new { code = "feature.unavailable" });
+        }
 
         if (string.IsNullOrWhiteSpace(request.IdPhotoKey))
         {

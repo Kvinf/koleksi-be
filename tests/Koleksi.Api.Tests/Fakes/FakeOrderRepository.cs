@@ -63,6 +63,13 @@ public sealed class FakeOrderRepository : FakeAdapter, IOrderRepository
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<Order>> ListDisputedForUserAsync(string userId, CancellationToken ct)
+    {
+        ThrowIfFailing();
+        return Task.FromResult<IReadOnlyList<Order>>(
+            [.. _orders.Values.Where(o => o.Dispute is not null && (o.BuyerId == userId || o.SellerId == userId)).OrderByDescending(o => o.CreatedAt).Select(Copy)]);
+    }
+
     public Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct)
     {
         ThrowIfFailing();

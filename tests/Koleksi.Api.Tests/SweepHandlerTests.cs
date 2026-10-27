@@ -678,6 +678,9 @@ public sealed class SweepHandlerTests
             await inner.UpdateAsync(order, expectedVersion, ct).ConfigureAwait(false);
         }
 
+        public Task<IReadOnlyList<Order>> ListDisputedForUserAsync(string userId, CancellationToken ct) =>
+            inner.ListDisputedForUserAsync(userId, ct);
+
         public Task<Page<Order>> ListForBuyerAsync(string buyerId, string? cursor, int limit, CancellationToken ct) =>
             inner.ListForBuyerAsync(buyerId, cursor, limit, ct);
 

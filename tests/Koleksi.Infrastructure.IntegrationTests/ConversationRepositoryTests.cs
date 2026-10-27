@@ -105,7 +105,13 @@ public sealed class ConversationRepositoryTests : DynamoTestBase
         var conversation = StartConversation();
         for (var i = 1; i <= 5; i++)
         {
-            await SendAsync(conversation, Buyer, $"pesan {i}");
+            // Message ids are time-ordered at millisecond resolution, so a thread is ordered by
+            // when its messages were sent. A person cannot send two in one millisecond; the test
+            // must not either, or the order within that millisecond is random.
+            var clock = new FixedClock { UtcNow = Fixtures.Clock.UtcNow.AddSeconds(i) };
+            var message = ChatMessage.Create(conversation.Id, Buyer, $"pesan {i}", clock);
+            conversation.RecordMessage(message);
+            await Table.Conversations.AppendAsync(conversation, message, Ct);
         }
 
         var latestThree = await Table.Conversations.ListMessagesAsync(conversation.Id, 3, Ct);

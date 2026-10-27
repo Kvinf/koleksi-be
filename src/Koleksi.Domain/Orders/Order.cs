@@ -36,6 +36,16 @@ public sealed class Order
     /// </remarks>
     public static readonly TimeSpan AutoReleaseAfterDelivery = TimeSpan.FromDays(2);
 
+    /// <summary>
+    /// How long a seller has to ship a paid order before the buyer may dispute it for not having shipped.
+    /// </summary>
+    /// <remarks>
+    /// Without it a buyer could freeze the escrow, and put a staff case in front of the seller, the moment they
+    /// paid (QA P-04). Three days from payment is the policy default; a dispute on a parcel that has been shipped
+    /// is never held back by it.
+    /// </remarks>
+    public static readonly TimeSpan ShipWindow = TimeSpan.FromDays(3);
+
     /// <summary>How long an unpaid order holds its stock before auto-cancelling.</summary>
     /// <remarks>Mirrors the 15-minute QRIS countdown shown at checkout stage 2.</remarks>
     public static readonly TimeSpan PaymentWindow = TimeSpan.FromMinutes(15);
@@ -436,6 +446,30 @@ public sealed class Order
         Version++;
     }
 
+    /// <summary>
+    /// When a buyer may first dispute an order that has been paid but not shipped (<see cref="ShipWindow"/> after payment);
+    /// <c>null</c> before payment. Once the parcel is shipped a dispute is open at any time.
+    /// </summary>
+    public DateTimeOffset? DisputableFrom => PaidAt + ShipWindow;
+
+    /// <summary>
+    /// Refuses a buyer's dispute on a paid order the seller has not yet had <see cref="ShipWindow"/> to ship. Called where a
+    /// buyer opens a dispute (<c>OpenOrderDisputeHandler</c>); <see cref="OpenDispute"/> itself stays state-only so that the
+    /// rest of the system, and its tests, can still put an order into dispute at any time.
+    /// </summary>
+    /// <exception cref="DomainException"><c>order.dispute_too_early</c>.</exception>
+    public void EnsureDisputeWindowOpen(IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (EscrowState == EscrowState.Paid && DisputableFrom is { } from && clock.UtcNow < from)
+        {
+            throw DomainException.For(
+                "order.dispute_too_early",
+                "The seller still has time to ship this order. You can open a dispute if it is not shipped by then.");
+        }
+    }
+
     /// <summary>Freezes release while the buyer's complaint is reviewed.</summary>
     public void OpenDispute(string reason, string actingBuyerId, IClock clock)
     {
@@ -638,6 +672,14 @@ public sealed record Shipment(
         ArgumentException.ThrowIfNullOrWhiteSpace(courierCode);
         ArgumentException.ThrowIfNullOrWhiteSpace(packedParcelPhotoKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(trackingLabelPhotoKey);
+
+        // Two photos, two views of the shipment: one image in both slots is one proof pretending to be two.
+        if (string.Equals(packedParcelPhotoKey, trackingLabelPhotoKey, StringComparison.Ordinal))
+        {
+            throw DomainException.For(
+                "shipment.proof_duplicate",
+                "The packed-parcel photo and the tracking-label photo must be two different photos.");
+        }
 
         var normalised = (trackingNumber ?? string.Empty).Trim().ToUpperInvariant();
         if (normalised.Length < MinTrackingNumberLength)

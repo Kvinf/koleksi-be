@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
 using Koleksi.Application.Abstractions;
+using Koleksi.Infrastructure;
+using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
 
 namespace Koleksi.Api.Tests;
@@ -212,6 +214,37 @@ public sealed class ProfileAbuseEndpointTests(KoleksiApiFactory factory) : IClas
         using var mine = await client.PostAsJsonAsync(
             "/api/profile/avatar", new { avatarKey = TestData.MediaKey(MediaPurpose.Avatar, userId, "me.jpg") });
         mine.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task While_ID_verification_is_off_no_identity_document_is_accepted_or_granted()
+    {
+        var features = factory.Services.GetRequiredService<FeaturesOptions>();
+        var userId = NewUserId();
+        using var client = factory.CreateClientAs(userId, "media.noid");
+        var document = TestData.MediaKey(MediaPurpose.IdentityDocument, userId, "ktp.jpg");
+
+        features.IdVerificationEnabled = false;
+        try
+        {
+            using var grant = await client.PostAsJsonAsync(
+                "/api/media/upload-grant", new { purpose = "IdentityDocument", contentType = "image/jpeg", contentLength = 100_000 });
+            grant.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+            (await grant.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("feature.unavailable");
+
+            using var submit = await client.PostAsJsonAsync("/api/profile/id-verification", new { idPhotoKey = document });
+            submit.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+            (await submit.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("feature.unavailable");
+
+            // The other purposes are unaffected.
+            using var avatar = await client.PostAsJsonAsync(
+                "/api/media/upload-grant", new { purpose = "Avatar", contentType = "image/jpeg", contentLength = 100_000 });
+            avatar.StatusCode.ShouldBe(HttpStatusCode.OK);
+        }
+        finally
+        {
+            features.IdVerificationEnabled = true;
+        }
     }
 
     [Fact]

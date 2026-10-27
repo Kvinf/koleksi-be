@@ -112,7 +112,11 @@ internal static class CartEndpoints
             TimeSpan.FromMinutes(10),
             () => handler.HandleAsync(command, ct),
             ct,
-            inFlight: InFlightPolicy.Reject).ConfigureAwait(false);
+            inFlight: InFlightPolicy.Reject,
+            fingerprint: RequestFingerprint.Of(
+                string.Join(',', (request.ListingIds ?? []).Order(StringComparer.Ordinal)),
+                string.Join(',', (request.CourierCodeByShop ?? new Dictionary<string, string>()).OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => pair.Key + "=" + pair.Value)),
+                shipTo.RecipientName, shipTo.Phone, shipTo.Street, shipTo.City, shipTo.Province, shipTo.PostalCode)).ConfigureAwait(false);
 
         if (!result.Found)
         {

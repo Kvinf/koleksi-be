@@ -217,6 +217,69 @@ public sealed class StockEndpointTests(KoleksiApiFactory factory) : IClassFixtur
     }
 
     [Fact]
+    public async Task The_sellers_dashboard_list_says_how_many_units_are_left_not_only_how_many_were_listed()
+    {
+        var listing = SeedListing(stock: 3);
+        using var buyer = Buyer("stock.dash");
+        (await buyer.PostAsJsonAsync("/api/orders/checkout", CheckoutBody("FixedPrice", listing.Id, 2))).StatusCode.ShouldBe(HttpStatusCode.OK);
+        using var seller = factory.CreateClientAs(listing.SellerId, "stock.dash.seller");
+
+        var mine = await (await seller.GetAsync("/api/listings/mine")).ReadJsonAsync();
+        var row = mine.GetProperty("items").EnumerateArray().Single(item => item.GetProperty("id").GetString() == listing.Id);
+
+        row.GetProperty("stock").GetInt32().ShouldBe(3);
+        row.GetProperty("stockAvailable").GetInt32().ShouldBe(1);
+        row.GetProperty("stockHeld").GetInt32().ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task A_dashboard_with_many_multi_unit_listings_answers_every_row_with_its_own_count()
+    {
+        // Twelve live multi-unit listings of one seller (more than the lookups run at once), with a different number held on each.
+        var sellerId = Guid.NewGuid().ToString();
+        var expected = new Dictionary<string, (int Stock, int Held)>(StringComparer.Ordinal);
+        using var buyer = Buyer("stock.dash.many.buyer");
+        for (var i = 0; i < 12; i++)
+        {
+            var listing = TestData.ActiveListingBy(sellerId, title: $"Gunpla RG nomor {i}", price: Money.FromRupiah(500_000));
+            listing.SetStock(4 + (i % 3), new MutableClock());
+            factory.Listings.Seed(listing);
+            var held = i % 3;
+            if (held > 0)
+            {
+                (await buyer.PostAsJsonAsync("/api/orders/checkout", CheckoutBody("FixedPrice", listing.Id, held))).StatusCode.ShouldBe(HttpStatusCode.OK);
+            }
+
+            expected[listing.Id] = (listing.Stock, held);
+        }
+
+        using var seller = factory.CreateClientAs(sellerId, "stock.dash.many.seller");
+        var mine = await (await seller.GetAsync("/api/listings/mine")).ReadJsonAsync();
+
+        var rows = mine.GetProperty("items").EnumerateArray().ToList();
+        rows.Count.ShouldBe(12);
+        foreach (var row in rows)
+        {
+            var (stock, held) = expected[row.GetProperty("id").GetString()!];
+            row.GetProperty("stockAvailable").GetInt32().ShouldBe(stock - held);
+            row.GetProperty("stockHeld").GetInt32().ShouldBe(held);
+        }
+    }
+
+    [Fact]
+    public async Task A_single_unit_listing_has_no_available_count_on_the_dashboard_list()
+    {
+        var listing = SeedListing(stock: 1);
+        using var seller = factory.CreateClientAs(listing.SellerId, "stock.dash.single");
+
+        var mine = await (await seller.GetAsync("/api/listings/mine")).ReadJsonAsync();
+        var row = mine.GetProperty("items").EnumerateArray().Single(item => item.GetProperty("id").GetString() == listing.Id);
+
+        // Null is left out of the JSON altogether; the dashboard reads absent and null the same way.
+        (!row.TryGetProperty("stockAvailable", out var available) || available.ValueKind == System.Text.Json.JsonValueKind.Null).ShouldBeTrue();
+    }
+
+    [Fact]
     public async Task An_auction_win_is_due_thirty_minutes_after_the_close_and_is_refused_after_that()
     {
         var (listing, auction) = SeedEndedAuction(out var winnerId);

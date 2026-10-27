@@ -200,7 +200,7 @@ internal sealed class DynamoPayoutRepository(IAmazonDynamoDB dynamo, DynamoOptio
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
 
-        var response = await dynamo.QueryAsync(
+        var response = await dynamo.QueryPageAsync(
             new QueryRequest
             {
                 TableName = options.TableName,

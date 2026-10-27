@@ -1,4 +1,4 @@
-using Amazon;
+﻿using Amazon;
 using Amazon.ApiGatewayManagementApi;
 using Amazon.CognitoIdentityProvider;
 using Amazon.DynamoDBv2;
@@ -57,7 +57,8 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton(options.Delivery);
         services.AddSingleton(options.Realtime);
         services.AddSingleton(options.Security);
-        services.AddSingleton<IAmazonDynamoDB>(_ => BuildDynamoClient(options));
+        services.AddSingleton(options.Features);
+        services.AddSingleton<IAmazonDynamoDB>(_ => BuildDynamoClient(options.Dynamo, options.Region));
         services.AddSingleton<IAmazonS3>(_ => BuildS3Client(options));
         services.AddSingleton<IAmazonSecretsManager>(_ => BuildSecretsClient(options));
         services.AddSingleton<IAmazonSimpleNotificationService>(_ => BuildSnsClient(options));
@@ -72,7 +73,9 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IListingHoldStore, DynamoListingHoldStore>();
         services.AddSingleton<IAccountStandingRepository, DynamoAccountStandingRepository>();
         services.AddSingleton<IPayoutRepository, DynamoPayoutRepository>();
+        services.AddSingleton<ICaseStore, DynamoCaseStore>();
         services.AddSingleton<IPaymentOrphanStore, DynamoPaymentOrphanStore>();
+        services.AddSingleton<IShippingClaimStore, DynamoShippingClaimStore>();
         services.AddSingleton<ICartRepository, DynamoCartRepository>();
         services.AddSingleton<IWatchlistRepository, DynamoWatchlistRepository>();
         services.AddSingleton<DynamoListingSearchIndex>();
@@ -127,6 +130,48 @@ public static class InfrastructureServiceCollectionExtensions
         return services;
     }
 
+    /// <summary>
+    /// Wires the admin API: DynamoDB, the idempotency store and the audit log, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <see cref="AddInfrastructure"/>: that registers the whole marketplace (S3, SES, SNS, the payment
+    /// gateway, the public Cognito client), none of which the admin Lambda has permission to use or should be able to
+    /// reach. Each milestone adds the repositories its screens need here, so the Lambda's reach grows only as fast as
+    /// the code that justifies it.
+    /// </remarks>
+    public static IServiceCollection AddAdminInfrastructure(this IServiceCollection services, KoleksiAdminOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(options);
+
+        services.AddSingleton(options);
+        services.AddSingleton(options.StaffPool);
+        services.AddSingleton(options.Dynamo);
+        services.AddSingleton<IAmazonDynamoDB>(_ => BuildDynamoClient(options.Dynamo, options.Region));
+
+        services.AddSingleton<IIdempotencyStore, DynamoIdempotencyStore>();
+        services.AddSingleton<IAuditLog, DynamoAuditLog>();
+
+        // Milestone 1: disputes. Orders, public profiles (for handles) and conversations are read through the same repositories the
+        // public API uses; the dispute store and the holiday store are the admin site's own writers.
+        services.AddSingleton<IOrderRepository, DynamoOrderRepository>();
+        services.AddSingleton<IPublicProfileRepository, DynamoPublicProfileRepository>();
+        services.AddSingleton<IConversationRepository, DynamoConversationRepository>();
+        services.AddSingleton<IDisputeAdminStore, DynamoDisputeAdminStore>();
+        services.AddSingleton<IHolidayStore, DynamoHolidayStore>();
+
+        // No payment gateway exists, so no refund sender moves money. The development switch picks the stand-in that says so differently.
+        if (options.Simulators.Enabled)
+        {
+            services.AddSingleton<IRefundSender, SimulatedRefundSender>();
+        }
+        else
+        {
+            services.AddSingleton<IRefundSender, PendingGatewayRefundSender>();
+        }
+
+        return services;
+    }
     /// <summary>
     /// Chooses how live events reach browsers: through API Gateway's WebSocket API when its
     /// management endpoint is configured, and nowhere otherwise.
@@ -227,28 +272,28 @@ public static class InfrastructureServiceCollectionExtensions
     /// reached by a deployed stage, whatever its environment variables say.
     /// </para>
     /// </remarks>
-    private static AmazonDynamoDBClient BuildDynamoClient(KoleksiOptions options)
+    private static AmazonDynamoDBClient BuildDynamoClient(DynamoOptions dynamo, string region)
     {
-        if (!string.IsNullOrWhiteSpace(options.Dynamo.ServiceUrl))
+        if (!string.IsNullOrWhiteSpace(dynamo.ServiceUrl))
         {
             return new AmazonDynamoDBClient(
                 LocalDevelopmentCredentials,
                 Bounded(new AmazonDynamoDBConfig
                 {
-                    ServiceURL = options.Dynamo.ServiceUrl,
+                    ServiceURL = dynamo.ServiceUrl,
 
                     // Signing needs a region name even though the endpoint is local, and
                     // DynamoDB Local partitions its tables by it when not sharing a database.
-                    AuthenticationRegion = string.IsNullOrWhiteSpace(options.Region)
+                    AuthenticationRegion = string.IsNullOrWhiteSpace(region)
                         ? "ap-southeast-3"
-                        : options.Region,
+                        : region,
                 }));
         }
 
         var config = Bounded(new AmazonDynamoDBConfig());
-        if (!string.IsNullOrWhiteSpace(options.Region))
+        if (!string.IsNullOrWhiteSpace(region))
         {
-            config.RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region);
+            config.RegionEndpoint = RegionEndpoint.GetBySystemName(region);
         }
 
         return new AmazonDynamoDBClient(config);

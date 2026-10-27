@@ -60,7 +60,10 @@ public static class PublicHandle
     /// Compared on letters and digits only, so <c>Koleksi.id</c>, <c>KOLEKSI official</c> and
     /// <c>a d m i n</c> are all caught however they are spaced or punctuated.
     /// </summary>
-    internal static bool Impersonates(string name)
+    internal static bool Impersonates(string name) =>
+        ImpersonatesSpelling(name) || LeetReadings(name).Exists(ImpersonatesSpelling);
+
+    private static bool ImpersonatesSpelling(string name)
     {
         var compact = new StringBuilder(name.Length);
         var words = new List<string>();
@@ -91,6 +94,59 @@ public static class PublicHandle
             || words.Exists(AuthorityWords.Contains);
     }
 
+    /// <summary>
+    /// The ways a name can be read once look-alike characters are given their letters: <c>0</c> as o, <c>3</c> as e,
+    /// <c>4</c> and <c>@</c> as a, <c>5</c> and <c>$</c> as s, <c>7</c> as t, and <c>1</c>, <c>!</c> and <c>|</c> as either i
+    /// or l (hence two readings). <c>k0leksi</c> and <c>4dm1n</c> are then the words they are made to look like (QA P-05).
+    /// </summary>
+    private static List<string> LeetReadings(string name)
+    {
+        var asI = new StringBuilder(name.Length);
+        var asL = new StringBuilder(name.Length);
+
+        foreach (var ch in name.ToLowerInvariant())
+        {
+            if (ch is '1' or '!' or '|')
+            {
+                asI.Append('i');
+                asL.Append('l');
+                continue;
+            }
+
+            var folded = ch switch
+            {
+                '0' => 'o',
+                '3' => 'e',
+                '4' or '@' => 'a',
+                '5' or '$' => 's',
+                '7' => 't',
+                _ => ch,
+            };
+            asI.Append(folded);
+            asL.Append(folded);
+        }
+
+        return [asI.ToString(), asL.ToString()];
+    }
+
+    /// <summary>
+    /// Whether a handle, read through look-alike characters and with separators dropped, is a reserved word or starts with
+    /// the platform's name. <c>k0leksi</c>, <c>ko-leksi</c> and <c>4dm1n</c> are all caught.
+    /// </summary>
+    private static bool HandleLooksReserved(string candidate)
+    {
+        foreach (var reading in LeetReadings(candidate))
+        {
+            var compact = new string(reading.Where(IsAlphanumeric).ToArray());
+            if (Reserved.Contains(compact) || compact.StartsWith(PlatformPrefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Words that, anywhere in a display name, claim to speak for the platform.</summary>
     private static readonly HashSet<string> AuthorityWords = new(StringComparer.Ordinal)
     {
@@ -119,7 +175,9 @@ public static class PublicHandle
             return "handle.invalid_format";
         }
 
-        if (Reserved.Contains(candidate) || candidate.StartsWith(PlatformPrefix, StringComparison.Ordinal))
+        if (Reserved.Contains(candidate)
+            || candidate.StartsWith(PlatformPrefix, StringComparison.Ordinal)
+            || HandleLooksReserved(candidate))
         {
             return "handle.reserved";
         }

@@ -90,6 +90,25 @@ public sealed class Payout
         return new Payout(order.Id, order.OrderNumber, order.SellerId, order.SellerPayout, order.PlatformFee, clock.UtcNow);
     }
 
+    /// <summary>
+    /// What the seller is owed out of the part of a refunded order the refund did not cover, when staff decide to pay it to them.
+    /// The amount is staff's decision, bounded by <see cref="Refund"/>, and copied here like any payout.
+    /// </summary>
+    public static Payout ForRemainder(Order order, Money amount, Money fee, IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(order);
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (order.EscrowState != EscrowState.Refunded || order.Dispute is not { Resolution: DisputeResolution.RefundToBuyer })
+        {
+            throw DomainException.For("payout.order_not_refunded", "Only an order refunded by a dispute ruling can pay out its remainder.");
+        }
+
+        return amount.IsZero
+            ? throw DomainException.For("payout.amount_invalid", "A payout must be more than zero.")
+            : new Payout(order.Id, order.OrderNumber, order.SellerId, amount, fee, clock.UtcNow);
+    }
+
     public static Payout Rehydrate(
         string orderId,
         string orderNumber,

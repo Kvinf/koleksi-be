@@ -80,7 +80,11 @@ internal static class ListingEndpoints
             Read(http),
             TimeSpan.FromMinutes(2),
             () => handler.HandleAsync(command, ct),
-            ct).ConfigureAwait(false);
+            ct,
+            fingerprint: RequestFingerprint.Of(
+                request.CategoryId, request.Title, request.PriceRupiah, request.Format, request.Condition, request.City,
+                request.Description, string.Join(',', (request.Photos ?? []).Select(p => p.StorageKey)), request.Publish,
+                request.Stock, request.AuctionDurationDays, request.ReservePriceRupiah, request.BuyoutPriceRupiah)).ConfigureAwait(false);
 
         return Results.Ok(new { listingId = result.ListingId, result.Published, result.CanonicalPath });
     }
@@ -207,6 +211,7 @@ internal static class ListingEndpoints
         IListingRepository listings,
         ICategoryRepository categories,
         IAuctionRepository auctions,
+        IListingHoldStore holds,
         PublicIdentityResolver identities,
         string? cursor,
         CancellationToken ct)
@@ -223,6 +228,14 @@ internal static class ListingEndpoints
         // serve pages of strangers' listings at once, not this.
         var ownHandle = (await identities.ResolveAsync(user.RequireUserId(), ct).ConfigureAwait(false)).Handle;
         var categoryCache = new Dictionary<string, Category?>(StringComparer.Ordinal);
+
+        // "Stock 3" says what was listed, not what is left once two are sold or held, which is what a seller looking at the
+        // dashboard wants to know. Only a multi-unit, live listing is asked: a single unit is either there or not (its status says
+        // which), and a draft has nothing reserved. The asks are independent, so they run side by side (a few at a time) and the
+        // wait is the slowest one, not the sum of fifty.
+        var stockUsage = await ReadStockUsageAsync(
+            holds, [.. page.Items.Where(listing => listing.Format != ListingFormat.Auction && listing.Stock > 1 && listing.Status == ListingStatus.Active)], ct)
+            .ConfigureAwait(false);
         var items = new List<object>(page.Items.Count);
 
         foreach (var listing in page.Items)
@@ -242,6 +255,14 @@ internal static class ListingEndpoints
                 bidCount = auction?.BidCount ?? 0;
             }
 
+            int? stockAvailable = null;
+            int? stockHeld = null;
+            if (stockUsage.TryGetValue(listing.Id, out var usage))
+            {
+                stockAvailable = usage.Available;
+                stockHeld = usage.Held;
+            }
+
             items.Add(new
             {
                 listing.Id,
@@ -258,12 +279,41 @@ internal static class ListingEndpoints
                 AuctionEndsAt = auctionEndsAt,
                 BidCount = bidCount,
                 listing.Stock,
+                StockAvailable = stockAvailable,
+                StockHeld = stockHeld,
                 listing.ViewCount,
                 listing.WatcherCount,
             });
         }
 
         return Results.Ok(new { items, nextCursor = page.NextCursor });
+    }
+
+    private const int StockReadConcurrency = 8;
+
+    private static async Task<IReadOnlyDictionary<string, StockAvailability>> ReadStockUsageAsync(
+        IListingHoldStore holds, IReadOnlyList<Listing> eligible, CancellationToken ct)
+    {
+        if (eligible.Count == 0)
+        {
+            return new Dictionary<string, StockAvailability>();
+        }
+
+        using var gate = new SemaphoreSlim(StockReadConcurrency);
+        var reads = eligible.Select(async listing =>
+        {
+            await gate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                return (listing.Id, Usage: await holds.GetAvailabilityAsync(listing.Id, listing.Stock, ct).ConfigureAwait(false));
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }).ToList();
+
+        return (await Task.WhenAll(reads).ConfigureAwait(false)).ToDictionary(read => read.Id, read => read.Usage, StringComparer.Ordinal);
     }
 
     /// <summary>

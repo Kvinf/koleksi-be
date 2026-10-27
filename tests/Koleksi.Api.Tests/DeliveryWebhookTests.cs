@@ -253,11 +253,12 @@ public sealed class DeliveryWebhookTests(KoleksiApiFactory factory) : IClassFixt
             return paid;
         }
 
+        // Fresh proof and waybill for every shipment: one set cannot back two orders.
         object Body() => new
         {
-            trackingNumber = "JX1234567890",
-            packedParcelPhotoKey = TestData.MediaKey(MediaPurpose.ShippingProof, listing.SellerId, "packed"),
-            trackingLabelPhotoKey = TestData.MediaKey(MediaPurpose.ShippingProof, listing.SellerId, "label"),
+            trackingNumber = "JX" + Guid.NewGuid().ToString("N")[..12],
+            packedParcelPhotoKey = TestData.MediaKey(MediaPurpose.ShippingProof, listing.SellerId, "packed-" + Guid.NewGuid().ToString("N")),
+            trackingLabelPhotoKey = TestData.MediaKey(MediaPurpose.ShippingProof, listing.SellerId, "label-" + Guid.NewGuid().ToString("N")),
             shippedOn = "2026-01-05",
         };
 

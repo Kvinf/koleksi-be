@@ -103,6 +103,7 @@ internal static class DynamoTable
     private const string CartItemPrefix = "ITEM#";
     private const string ListingHoldPrefix = "HOLD#";
     private const string PaymentOrphanPrefix = "PAYORPHAN#";
+    private const string ShippingClaimPrefix = "SHIPCLAIM#";
     private const string RealtimeTicketPrefix = "WS#TICKET#";
     private const string RealtimeTopicPrefix = "WS#TOPIC#";
     private const string RealtimeConnectionSkPrefix = "CONN#";
@@ -566,8 +567,86 @@ internal static class DynamoTable
     /// <summary>The short reservation on a listing while a buyer's order awaits payment.</summary>
     public static string ListingHoldPk(string listingId) => ListingHoldPrefix + Require(listingId);
 
+    // Admin dispute handling (Milestone 1). Case notes, the "waiting for information" marker and the refund hang off the order's own
+    // key space or a partition of their own; none of them carries an index attribute, so none appears in a seller's or buyer's list.
+
+    /// <summary>The state names the dispute queues use inside the sparse sweep index (<see cref="OrderDuePkValue"/>). The sweeps ask only for their own states, so these are invisible to them.</summary>
+    public const string DisputedQueueState = "Disputed";
+
+    public const string DisputeResolvedQueueState = "DisputeResolved";
+
+    private const string DisputeNotePrefix = "DISPUTENOTE#";
+
+    /// <summary>A case note, in the order's partition, sorted by its time-ordered id.</summary>
+    public static string DisputeNoteSk(string noteId) => DisputeNotePrefix + Require(noteId);
+
+    public static string DisputeNoteSkPrefix() => DisputeNotePrefix;
+
+    /// <summary>One small row per order that has an information request staff are waiting on; deleted when the case is ruled on.</summary>
+    public static string DisputeInfoSk() => "DISPUTEINFO";
+
+    /// <summary>The refund for an order: one per order, written with the ruling.</summary>
+    public static string RefundPk(string orderId) => "REFUND#" + Require(orderId);
+
+    public static string RefundSk() => "META";
+
+    /// <summary>A person's pending notices (see <c>OrderNotice</c>): nothing delivers them yet.</summary>
+    public static string NoticePk(string userId) => "NOTICE#" + Require(userId);
+
+    public static string NoticeSk(DateTimeOffset at, string noticeId) => $"{FormatInstant(at)}#{Require(noticeId)}";
+
+    /// <summary>One year's holidays. A query on this partition is the whole holiday list for the year.</summary>
+    public static string HolidayPk(int year) => "HOLIDAY#" + year.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The holiday's own sort key: its date, <c>yyyy-MM-dd</c>, so a year reads in date order.</summary>
+    public static string HolidaySk(string isoDate) => Require(isoDate);
+
+    /// <summary>Marks a year as seeded, so a holiday staff removed is never put back. Starts with "#", so it never matches a date.</summary>
+    public static string HolidaySeededSk() => "#SEEDED";
+
+    // A person's disputes: one tiny pointer row per (person, order), written in the same transaction that gives the order its dispute,
+    // so "every dispute this person is in, as buyer or seller" is one Query on one partition instead of paging all their orders.
+    private const string UserDisputePrefix = "UDISPUTE#";
+
+    public static string UserDisputePk(string userId) => UserDisputePrefix + Require(userId);
+
+    /// <summary>The order id itself, so a person's pointers sort in order-id (creation) order.</summary>
+    public static string UserDisputeSk(string orderId) => Require(orderId);
+
+    // Admin audit log. Every audit entry is stored three times, in the same transaction: once in a partition
+    // per calendar month (the unfiltered view), once under the acting staff member, once under the thing
+    // acted on. A filtered view is then one Query on one partition, never a Scan and never a new index. All
+    // three start with "AUDIT#", which is what the admin Lambda's IAM policy matches (dynamodb:LeadingKeys)
+    // to deny any update or delete of an audit row.
+
+    /// <summary>The prefix every audit partition key starts with, and the one IAM denies updates and deletes on.</summary>
+    public const string AuditPrefix = "AUDIT#";
+
+    /// <summary>Partition for all entries written in the UTC calendar month of <paramref name="at"/>.</summary>
+    public static string AuditMonthPk(DateTimeOffset at) =>
+        AuditMonthPk(at.UtcDateTime.ToString("yyyyMM", CultureInfo.InvariantCulture));
+
+    public static string AuditMonthPk(string yyyyMm) => AuditPrefix + "ALL#" + Require(yyyyMm);
+
+    /// <summary>Partition for every entry written by one staff member.</summary>
+    public static string AuditActorPk(string actorId) => AuditPrefix + "ACTOR#" + Require(actorId);
+
+    /// <summary>Partition for every entry about one target (a user, a listing, an order...).</summary>
+    public static string AuditTargetPk(string targetType, string targetId) =>
+        $"{AuditPrefix}TARGET#{Require(targetType)}#{Require(targetId)}";
+
+    /// <summary>Sort key: the instant, then the id, so a descending query is newest first and two entries in one tick never collide.</summary>
+    public static string AuditSk(DateTimeOffset at, string entryId) => $"{FormatInstant(at)}#{Require(entryId)}";
+
     /// <summary>Partition of the orphaned-payment records for one order number. See <c>IPaymentOrphanStore</c>.</summary>
     public static string PaymentOrphanPk(string orderNumber) => PaymentOrphanPrefix + Require(orderNumber);
+
+    /// <summary>
+    /// Partition of one shipping claim: a proof photo key or a waybill, which may back only one order. See
+    /// <c>IShippingClaimStore</c>. <paramref name="kind"/> keeps a photo key and a waybill from ever colliding.
+    /// </summary>
+    public static string ShippingClaimPk(string kind, string value) =>
+        $"{ShippingClaimPrefix}{Require(kind)}#{Require(value)}";
 
     // ─── Realtime ───────────────────────────────────────────────────────────────
     //

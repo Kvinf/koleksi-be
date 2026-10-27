@@ -168,6 +168,13 @@ internal static class OrderItem
             EscrowState.AwaitingPayment => (nameof(EscrowState.AwaitingPayment), order.PaymentDueAt),
             EscrowState.Delivered when order.AutoReleaseAt is { } releaseAt => (nameof(EscrowState.Delivered), releaseAt),
             EscrowState.Shipped or EscrowState.InTransit when order.NextTrackingCheckAt is { } checkAt => (TrackingState, checkAt),
+
+            // The back office's dispute queues ride the same sparse index under states of their own, which no sweep asks for. An
+            // open dispute is keyed by when it was opened (so the queue reads oldest first), a resolved one by when it was resolved.
+            // Because an order is always written whole, the key appears when it enters Disputed and is gone when the ruling lands.
+            EscrowState.Disputed when order.Dispute is { } open => (DynamoTable.DisputedQueueState, open.OpenedAt),
+            EscrowState.Released or EscrowState.Refunded when order.Dispute is { ResolvedAt: { } resolvedAt } =>
+                (DynamoTable.DisputeResolvedQueueState, resolvedAt),
             _ => null,
         };
     }

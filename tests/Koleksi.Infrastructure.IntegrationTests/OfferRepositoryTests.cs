@@ -53,7 +53,7 @@ public sealed class OfferRepositoryTests : DynamoTestBase
     }
 
     [DynamoLocalFact]
-    public async Task An_accepted_offer_is_still_the_buyers_open_deal_until_it_is_spent()
+    public async Task An_accepted_offer_is_still_the_buyers_open_deal_until_it_is_resolved()
     {
         var listing = Fixtures.ActiveListing(format: Koleksi.Domain.Catalog.ListingFormat.AcceptOffers);
         await Table.Listings.AddAsync(listing, Ct);
@@ -67,14 +67,29 @@ public sealed class OfferRepositoryTests : DynamoTestBase
         (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldNotBeNull();
         (await Table.Offers.FindAsync(offer.Id, Ct))!.Status.ShouldBe(OfferStatus.Accepted);
 
-        // Spent: now the buyer is free to make a fresh offer, and the order id is kept.
+        // Checked out: the order may still die unpaid and reopen the deal (D-08), so the buyer's
+        // pointer stays and they still cannot stack a second offer. The order id is kept.
         offer.MarkCheckedOut(Fixtures.BidderId, "order-1", Fixtures.Clock);
         await Table.Offers.UpdateAsync(offer, expectedVersion: 1, Ct);
 
-        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldBeNull();
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldNotBeNull();
         var stored = (await Table.Offers.FindAsync(offer.Id, Ct))!;
         stored.Status.ShouldBe(OfferStatus.CheckedOut);
         stored.OrderId.ShouldBe("order-1");
+
+        // The unpaid order dies: the deal is the buyer's again, still open.
+        offer.ReopenAfterUnpaidOrder(Fixtures.Clock);
+        await Table.Offers.UpdateAsync(offer, expectedVersion: 2, Ct);
+
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldNotBeNull();
+        (await Table.Offers.FindAsync(offer.Id, Ct))!.Status.ShouldBe(OfferStatus.Accepted);
+
+        // Resolved: its deadline passes, the pointer goes, and the buyer may make a fresh offer.
+        offer.Expire(new FixedClock { UtcNow = offer.ExpiresAt }).ShouldBeTrue();
+        await Table.Offers.UpdateAsync(offer, expectedVersion: 3, Ct);
+
+        (await Table.Offers.FindActiveAsync(listing.Id, Fixtures.BidderId, Ct)).ShouldBeNull();
+        (await Table.Offers.FindAsync(offer.Id, Ct))!.Status.ShouldBe(OfferStatus.Expired);
     }
 
     [DynamoLocalFact]
@@ -106,18 +121,20 @@ public sealed class OfferRepositoryTests : DynamoTestBase
         await Table.Offers.UpdateAsync(offer, expectedVersion: 0, Ct);
 
         // Each checkout reads the offer, then tries to spend it with a write conditional on
-        // the version it read. The table lets exactly one of them through.
+        // the version it read. The table lets exactly one of them through. A checkout that reads
+        // after the winner committed is refused by the domain instead ("already used"), which is
+        // just as much a loss: which refusal a loser meets depends on timing.
         var claims = Enumerable.Range(0, 8).Select(async attempt =>
         {
             var copy = (await Table.Offers.FindAsync(offer.Id, Ct))!;
             var version = copy.Version;
-            copy.MarkCheckedOut(Fixtures.BidderId, $"order-{attempt}", Fixtures.Clock);
             try
             {
+                copy.MarkCheckedOut(Fixtures.BidderId, $"order-{attempt}", Fixtures.Clock);
                 await Table.Offers.UpdateAsync(copy, version, Ct);
                 return true;
             }
-            catch (ConcurrencyConflictException)
+            catch (Exception lost) when (lost is ConcurrencyConflictException or DomainException { Code: "offer.already_used" })
             {
                 return false;
             }

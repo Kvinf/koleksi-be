@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Infrastructure;
 
 namespace Koleksi.Api.Endpoints;
 
@@ -76,9 +77,15 @@ internal static class MediaEndpoints
         string OriginalContentType, long OriginalContentLength, long LargeContentLength, long SmallContentLength);
 
     private static async Task<IResult> CreateUploadGrantAsync(
-        UploadGrantRequest request, ICurrentUser user, IMediaStorage media, CancellationToken ct)
+        UploadGrantRequest request, ICurrentUser user, IMediaStorage media, FeaturesOptions features, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        // Nothing reviews identity documents yet, so none is accepted (see FeaturesOptions.IdVerificationEnabled).
+        if (request.Purpose == MediaPurpose.IdentityDocument && !features.IdVerificationEnabled)
+        {
+            return Results.NotFound(new { code = "feature.unavailable" });
+        }
 
         if (string.IsNullOrWhiteSpace(request.ContentType) || request.ContentLength <= 0)
         {

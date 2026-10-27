@@ -103,7 +103,10 @@ internal static class OrderEndpoints
             IdempotencyRetention,
             () => handler.HandleAsync(command, ct),
             ct,
-            inFlight: InFlightPolicy.Reject).ConfigureAwait(false);
+            inFlight: InFlightPolicy.Reject,
+            fingerprint: RequestFingerprint.Of(
+                source, request.ReferenceId, command.Quantity, request.CourierCode,
+                shipTo.RecipientName, shipTo.Phone, shipTo.Street, shipTo.City, shipTo.Province, shipTo.PostalCode)).ConfigureAwait(false);
 
         if (!result.Found)
         {
@@ -209,7 +212,9 @@ internal static class OrderEndpoints
             IdempotencyRetention,
             () => handler.HandleAsync(command, ct),
             ct,
-            inFlight: InFlightPolicy.Reject).ConfigureAwait(false);
+            inFlight: InFlightPolicy.Reject,
+            fingerprint: RequestFingerprint.Of(
+                request.TrackingNumber, request.PackedParcelPhotoKey, request.TrackingLabelPhotoKey, request.ShippedOn)).ConfigureAwait(false);
 
         return outcome.Found
             ? Results.Ok(new { escrowState = outcome.EscrowState.ToString() })
@@ -415,6 +420,10 @@ internal static class OrderEndpoints
         sellerPayoutRupiah = string.Equals(viewerRole, "seller", StringComparison.Ordinal) ? order.SellerPayout.Rupiah : (long?)null,
         trackingNumber = order.Shipment?.TrackingNumber,
         disputeOpen = order.Dispute is { Resolution: null },
+
+        // A paid order that has not shipped cannot be disputed until this moment (the seller's time to ship). Null once it
+        // no longer matters, so the page shows the dispute action whenever this is absent.
+        disputableFrom = order.EscrowState == EscrowState.Paid ? order.DisputableFrom : null,
     };
 
     private sealed record ShippingAddressRequest(

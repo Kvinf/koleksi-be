@@ -199,7 +199,7 @@ internal sealed class DynamoListingRepository(IAmazonDynamoDB dynamo, DynamoOpti
         // on is exactly where the page ends and is a correct cursor to resume from.
         do
         {
-            var response = await dynamo.QueryAsync(
+            var response = await dynamo.QueryPageAsync(
                 new QueryRequest
                 {
                     TableName = options.TableName,
@@ -429,6 +429,36 @@ internal static class DynamoCursor
     // number of fields.
     private const char PairSeparator = (char)0x1F;
     private const char FieldSeparator = (char)0x1E;
+
+    /// <summary>
+    /// Runs a query that may resume from a caller-supplied cursor. DynamoDB refuses a start key that does not fit
+    /// the query ("starting key is invalid", "does not match the range key predicate", "outside query
+    /// boundaries"), which is also why a forged cursor can never reach another partition. That refusal is the
+    /// caller's mistake, so it becomes <see cref="InvalidCursorException"/> (a 400) instead of an unhandled 500.
+    /// </summary>
+    public static async Task<QueryResponse> QueryPageAsync(
+        this IAmazonDynamoDB dynamo, QueryRequest request, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(dynamo);
+        ArgumentNullException.ThrowIfNull(request);
+
+        try
+        {
+            return await dynamo.QueryAsync(request, ct).ConfigureAwait(false);
+        }
+        catch (AmazonDynamoDBException failure)
+            when (request.ExclusiveStartKey is { Count: > 0 }
+                && IsBadStartKey(failure))
+        {
+            throw new InvalidCursorException("The page cursor is not valid.", failure);
+        }
+    }
+
+    // DynamoDB words this several ways ("The provided starting key is invalid", "...does not match the range key
+    // predicate", "Exclusive Start Key must have same size as table's key schema"); all of them name the start key.
+    private static bool IsBadStartKey(AmazonDynamoDBException failure) =>
+        failure.Message.Contains("starting key", StringComparison.OrdinalIgnoreCase)
+        || failure.Message.Contains("start key", StringComparison.OrdinalIgnoreCase);
 
     public static string? Encode(Dictionary<string, AttributeValue>? lastEvaluatedKey)
     {

@@ -72,6 +72,9 @@ public static class ApplicationServiceCollectionExtensions
         services.AddScoped<MarkOrderShippedHandler>();
         services.AddScoped<ConfirmDeliveryHandler>();
         services.AddScoped<OpenOrderDisputeHandler>();
+        services.AddScoped<Features.Cases.ListMyCasesHandler>();
+        services.AddScoped<Features.Cases.ReplyToCaseHandler>();
+        services.AddScoped<Features.Cases.ListMyRefundsHandler>();
         services.AddScoped<CancelOrderHandler>();
 
         services.AddScoped<AddToCartHandler>();
@@ -110,6 +113,35 @@ public static class ApplicationServiceCollectionExtensions
         services.AddScoped<PayoutSender>();
         services.AddScoped<ApplyDeliveryNotificationHandler>();
         services.AddScoped<SweepOrchestrator>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// The admin site's use cases, and only those. A separate method from <see cref="AddApplication"/> on
+    /// purpose: the admin API must not resolve (or even contain registrations for) the marketplace's own
+    /// handlers, which need repositories and ports it does not wire.
+    /// </summary>
+    public static IServiceCollection AddAdminApplication(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.AddSingleton<IClock>(SystemClock.Instance);
+
+        // Scoped: they read ICurrentStaff, which is per-request.
+        services.AddScoped<Features.Admin.StartStaffSessionHandler>();
+        services.AddScoped<Features.Admin.ListAuditHandler>();
+
+        // Milestone 1: disputes and holidays.
+        services.AddScoped<Features.Admin.GetOverviewHandler>();
+        services.AddScoped<Features.Admin.ListDisputesHandler>();
+        services.AddScoped<Features.Admin.GetDisputeHandler>();
+        services.AddScoped<Features.Admin.AddDisputeNoteHandler>();
+        services.AddScoped<Features.Admin.ResolveDisputeHandler>();
+        services.AddScoped<Features.Admin.SettleRemainderHandler>();
+        services.AddScoped<Features.Admin.ListHolidaysHandler>();
+        services.AddScoped<Features.Admin.AddHolidayHandler>();
+        services.AddScoped<Features.Admin.RemoveHolidayHandler>();
 
         return services;
     }

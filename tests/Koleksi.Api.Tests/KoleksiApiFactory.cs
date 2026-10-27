@@ -67,6 +67,7 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
         VerificationThrottle = new FakeVerificationThrottle(Clock);
         Holds = new FakeListingHoldStore(Clock);
         PaymentOrphans = new FakePaymentOrphanStore();
+        ShippingClaims = new FakeShippingClaimStore();
         Watchlist = new FakeWatchlistRepository(Listings);
     }
 
@@ -119,12 +120,17 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
 
     public FakePaymentOrphanStore PaymentOrphans { get; }
 
+    public FakeShippingClaimStore ShippingClaims { get; }
+
     public FakeOrderSweepBackfill OrderSweepBackfill { get; } = new();
 
     /// <summary>The payouts owed to sellers; shared with <see cref="Orders"/> so a release writes both.</summary>
     public FakePayoutRepository Payouts => Orders.Payouts;
 
     public FakeAccountStandingRepository Standings { get; } = new();
+
+    /// <summary>What the back office wrote for disputes (notes, notices, refunds), as the public site reads it.</summary>
+    public FakeCaseStore Cases { get; } = new();
 
     public FakeDeliveryTracker Courier { get; } = new();
 
@@ -207,6 +213,9 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
         // suite that silently picked them up would be authenticating against nothing.
         Set("ASPNETCORE_ENVIRONMENT", "Testing");
 
+        // The ID-verification feature is off by default in a real stage; the suite turns it on and has its own test for off.
+        Set("KOLEKSI__FEATURES__IDVERIFICATIONENABLED", "true");
+
         Set("KOLEKSI__REGION", Region);
         Set("KOLEKSI__COGNITO__USERPOOLID", UserPoolId);
         Set("KOLEKSI__COGNITO__CLIENTID", ClientId);
@@ -279,11 +288,13 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
         Replace<IOrderSweepBackfill>(services, OrderSweepBackfill);
         Replace<IListingHoldStore>(services, Holds);
         Replace<IPayoutRepository>(services, Orders.Payouts);
+        Replace<ICaseStore>(services, Cases);
         Replace<IAccountStandingRepository>(services, Standings);
         Replace<IDeliveryTracker>(services, Courier);
         services.AddSingleton<IDeliveryWebhookProvider>(DeliveryWebhook);
         Replace<IEscrowPayout>(services, PayoutProvider);
         Replace<IPaymentOrphanStore>(services, PaymentOrphans);
+        Replace<IShippingClaimStore>(services, ShippingClaims);
         Replace<ICartRepository>(services, Cart);
         Replace<IWatchlistRepository>(services, Watchlist);
 

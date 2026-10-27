@@ -153,9 +153,9 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
     }
 
     [Fact]
-    public async Task A_buyer_can_open_a_dispute_on_a_paid_order()
+    public async Task A_buyer_can_open_a_dispute_on_a_shipped_order()
     {
-        var order = SeedPaidOrder();
+        var order = SeedShippedOrder();
         using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
 
         using var response = await client.PostAsJsonAsync(
@@ -163,6 +163,55 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
         (await response.ReadJsonAsync()).GetProperty("escrowState").GetString().ShouldBe("Disputed");
+    }
+
+    // ─── Disputing an order that has not shipped (QA P-04) ───────────────────────
+
+    [Fact]
+    public async Task A_buyer_cannot_dispute_a_paid_order_the_seller_has_had_no_time_to_ship()
+    {
+        var order = SeedPaidOrder();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var response = await client.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/dispute", new { reason = "Barang belum dikirim sama sekali." });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("order.dispute_too_early");
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task A_buyer_can_dispute_a_paid_order_that_is_still_not_shipped_after_the_ship_window()
+    {
+        var order = SeedPaidOrder();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        factory.Clock.Advance(Order.ShipWindow + TimeSpan.FromMinutes(1));
+        try
+        {
+            using var response = await client.PostAsJsonAsync(
+                $"/api/orders/{order.Id}/dispute", new { reason = "Barang belum dikirim sama sekali." });
+
+            response.StatusCode.ShouldBe(HttpStatusCode.OK);
+            (await response.ReadJsonAsync()).GetProperty("escrowState").GetString().ShouldBe("Disputed");
+        }
+        finally
+        {
+            factory.Clock.Advance(-(Order.ShipWindow + TimeSpan.FromMinutes(1)));
+        }
+    }
+
+    [Fact]
+    public async Task The_order_says_when_a_paid_unshipped_order_can_first_be_disputed()
+    {
+        var order = SeedPaidOrder();
+        using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+
+        using var response = await buyer.GetAsync($"/api/orders/{order.Id}");
+
+        var from = (await response.ReadJsonAsync()).GetProperty("order").GetProperty("disputableFrom").GetDateTimeOffset();
+        from.ShouldBe(order.PaidAt!.Value + Order.ShipWindow);
     }
 
     [Fact]
@@ -333,7 +382,7 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
     [Fact]
     public async Task A_dispute_cannot_be_opened_twice_and_the_first_reason_is_kept()
     {
-        var order = SeedPaidOrder();
+        var order = SeedShippedOrder();
         using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
 
         using var first = await buyer.PostAsJsonAsync($"/api/orders/{order.Id}/dispute", new { reason = "Alasan pertama." });
@@ -363,7 +412,7 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
     [Fact]
     public async Task A_dispute_reason_is_capped_at_one_thousand_characters()
     {
-        var order = SeedPaidOrder();
+        var order = SeedShippedOrder();
         using var buyer = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
 
         using var tooLong = await buyer.PostAsJsonAsync(
@@ -476,6 +525,154 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
         ok.StatusCode.ShouldBe(HttpStatusCode.OK);
     }
 
+    // ─── An Idempotency-Key names one request (QA P-06) ──────────────────────────
+
+    [Fact]
+    public async Task A_retry_of_the_same_checkout_replays_the_first_order()
+    {
+        var listing = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", listing.Id));
+        using var retry = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", listing.Id));
+
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+        retry.StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await retry.ReadJsonAsync()).GetProperty("orderId").GetString()
+            .ShouldBe((await first.ReadJsonAsync()).GetProperty("orderId").GetString());
+    }
+
+    [Fact]
+    public async Task The_same_key_on_a_different_checkout_is_refused_not_answered_with_the_first_order()
+    {
+        var one = SeedFixedPriceListing();
+        var other = SeedFixedPriceListing();
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", one.Id));
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var different = await PostWithKeyAsync(client, "/api/orders/checkout", key, CheckoutBody("FixedPrice", other.Id));
+
+        different.StatusCode.ShouldBe(HttpStatusCode.UnprocessableEntity);
+        (await different.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("idempotency.key_reused");
+    }
+
+    [Fact]
+    public async Task The_same_key_with_a_different_shipment_is_refused()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostWithKeyAsync(seller, $"/api/orders/{order.Id}/shipment", key, ShipBody(TestData.SellerId));
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var different = await PostWithKeyAsync(seller, $"/api/orders/{order.Id}/shipment", key, ShipBody(TestData.SellerId));
+
+        different.StatusCode.ShouldBe(HttpStatusCode.UnprocessableEntity);
+        (await different.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("idempotency.key_reused");
+    }
+
+    private static async Task<HttpResponseMessage> PostWithKeyAsync(HttpClient client, string url, string key, object body)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = JsonContent.Create(body) };
+        request.Headers.Add("Idempotency-Key", key);
+        return await client.SendAsync(request);
+    }
+
+    // ─── Proof and waybill reuse (QA P-03) ───────────────────────────────────────
+
+    [Fact]
+    public async Task The_same_proof_photos_cannot_back_a_second_order()
+    {
+        var first = SeedPaidOrder();
+        var second = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        var packed = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "reuse-packed");
+        var label = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "reuse-label");
+
+        using var firstShipment = await seller.PostAsJsonAsync(
+            $"/api/orders/{first.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        firstShipment.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // A different waybill, the same two photos.
+        using var reused = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        reused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await reused.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_reused");
+
+        // One photo of the old set is enough to be refused.
+        using var half = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, labelKey: label));
+        half.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await half.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_reused");
+
+        (await factory.Orders.FindAsync(second.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+
+        // New photos of this parcel are accepted.
+        using var fresh = await seller.PostAsJsonAsync($"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId));
+        fresh.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task The_same_tracking_number_cannot_be_used_on_a_second_order()
+    {
+        var first = SeedPaidOrder();
+        var second = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+
+        using var firstShipment = await seller.PostAsJsonAsync(
+            $"/api/orders/{first.Id}/shipment", ShipBody(TestData.SellerId, trackingNumber: "JNE-REUSED-001"));
+        firstShipment.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        // Spacing and case do not make it a different waybill: it is stored trimmed and upper-cased.
+        using var reused = await seller.PostAsJsonAsync(
+            $"/api/orders/{second.Id}/shipment", ShipBody(TestData.SellerId, trackingNumber: "  jne-reused-001 "));
+        reused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await reused.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.tracking_reused");
+
+        (await factory.Orders.FindAsync(second.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task One_photo_cannot_fill_both_proof_slots()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var only = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "one-photo");
+
+        using var response = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: only, labelKey: only));
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+        (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("shipment.proof_duplicate");
+        (await factory.Orders.FindAsync(order.Id, CancellationToken.None))!.EscrowState.ShouldBe(EscrowState.Paid);
+    }
+
+    [Fact]
+    public async Task A_refused_shipment_does_not_use_up_its_photos()
+    {
+        var order = SeedPaidOrder();
+        using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
+        var packed = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "kept-packed");
+        var label = TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "kept-label");
+
+        // Refused for a short waybill, before anything is claimed.
+        using var refused = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment",
+            ShipBody(TestData.SellerId, trackingNumber: "SHORT", packedKey: packed, labelKey: label));
+        refused.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+
+        // The same photos, corrected, still work for the same order.
+        using var corrected = await seller.PostAsJsonAsync(
+            $"/api/orders/{order.Id}/shipment", ShipBody(TestData.SellerId, packedKey: packed, labelKey: label));
+        corrected.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
     [Fact]
     public async Task Missing_proof_keys_are_a_bad_request()
     {
@@ -496,12 +693,13 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
         var order = SeedPaidOrder();
         using var seller = factory.CreateClientAs(TestData.SellerId, TestData.SellerUsername);
         var key = Guid.NewGuid().ToString();
+        var body = ShipBody(TestData.SellerId);
 
         for (var attempt = 0; attempt < 2; attempt++)
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, $"/api/orders/{order.Id}/shipment")
             {
-                Content = JsonContent.Create(ShipBody(TestData.SellerId)),
+                Content = JsonContent.Create(body),
             };
             request.Headers.Add("Idempotency-Key", key);
             using var response = await seller.SendAsync(request);
@@ -577,18 +775,29 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
         response.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
     }
 
+    private static int _shipmentCounter;
+
+    /// <summary>
+    /// A shipment body. Unless a test says otherwise the waybill and both photos are new for every call, because one set of
+    /// proof cannot back two orders.
+    /// </summary>
     private static object ShipBody(
         string ownerId,
-        string trackingNumber = "JX1234567890",
+        string? trackingNumber = null,
         string shippedOn = "2026-01-05",
         string? packedKey = null,
-        string? labelKey = null) => new
+        string? labelKey = null)
     {
-        trackingNumber,
-        packedParcelPhotoKey = packedKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, "packed"),
-        trackingLabelPhotoKey = labelKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, "label"),
-        shippedOn,
-    };
+        var n = Interlocked.Increment(ref _shipmentCounter);
+
+        return new
+        {
+            trackingNumber = trackingNumber ?? $"JX{n:D10}",
+            packedParcelPhotoKey = packedKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, $"packed-{n}"),
+            trackingLabelPhotoKey = labelKey ?? TestData.MediaKey(MediaPurpose.ShippingProof, ownerId, $"label-{n}"),
+            shippedOn,
+        };
+    }
 
     private static object CheckoutBody(string source, string referenceId) => new
     {
@@ -644,6 +853,20 @@ public sealed class OrderEndpointTests(KoleksiApiFactory factory) : IClassFixtur
             [new OrderLine(listing.Id, listing.Title, null, listing.Price, Quantity: 1)],
             SampleShippingAddress(), FlatRateCourier(), new FixedTestClock());
         order.ConfirmPayment(order.GrandTotal, new FixedTestClock());
+        factory.Orders.Seed(order);
+        return order;
+    }
+
+    private Order SeedShippedOrder()
+    {
+        var order = SeedPaidOrder();
+        order.MarkShipped(
+            Shipment.Create(
+                "jne", $"JX{Interlocked.Increment(ref _shipmentCounter):D10}",
+                TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "seeded-packed"),
+                TestData.MediaKey(MediaPurpose.ShippingProof, TestData.SellerId, "seeded-label"),
+                new DateOnly(2026, 3, 1)),
+            TestData.SellerId, new FixedTestClock());
         factory.Orders.Seed(order);
         return order;
     }

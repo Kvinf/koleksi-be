@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Koleksi.Infrastructure\Koleksi.Infrastructure.csproj" />
+    <ProjectReference Include="..\Koleksi.Application\Koleksi.Application.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Amazon.Lambda.AspNetCoreServer.Hosting" Version="2.2.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.11" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Lambda's provided.al2023 custom runtime requires the entrypoint executable to be named exactly
+         "bootstrap" (the admin stack sets handler: "bootstrap"). A self-contained publish then produces that
+         name directly, with no separate rename step to remember or forget. -->
+    <AssemblyName>bootstrap</AssemblyName>
+    <UserSecretsId>5b0f7b3e-6d0e-4f43-9d8e-2c1c2f6a7a10</UserSecretsId>
+  </PropertyGroup>
+
+  <!-- Development settings (localhost endpoints, the local staff account name) belong on a developer's machine, not in the Lambda
+       package. A deployed stage runs as Production or Staging and never reads this file; leaving it out makes that certain. -->
+  <ItemGroup>
+    <Content Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
+  <!-- The admin API's own tests need to see Program's internals (the local-staff switch) and nothing else. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Koleksi.AdminApi.Tests" />
+  </ItemGroup>
+
+</Project>

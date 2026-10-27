@@ -145,13 +145,13 @@ public sealed class OrderDueKeyTests
     [Fact]
     public void Every_other_state_is_written_without_the_entry()
     {
+        // Disputed and the two ways a dispute ends have entries of their own, in partitions no sweep asks for: see DisputeQueueKeyTests.
         var clock = new FixedClock(Start);
 
         var states = new Dictionary<string, Order>
         {
             ["Paid"] = Paid(clock),
             ["Cancelled"] = Cancelled(clock),
-            ["Disputed"] = Disputed(clock),
             ["Released"] = Released(clock),
         };
 
@@ -169,12 +169,6 @@ public sealed class OrderDueKeyTests
             return order;
         }
 
-        static Order Disputed(FixedClock c)
-        {
-            var order = Delivered(c);
-            order.OpenDispute("Barang tidak sesuai", Buyer, c);
-            return order;
-        }
 
         static Order Released(FixedClock c)
         {

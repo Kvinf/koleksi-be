@@ -118,7 +118,7 @@ internal sealed class DynamoReviewRepository(IAmazonDynamoDB dynamo, DynamoOptio
         ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
         ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
 
-        var response = await dynamo.QueryAsync(
+        var response = await dynamo.QueryPageAsync(
             new QueryRequest
             {
                 TableName = options.TableName,

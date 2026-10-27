@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace Koleksi.Application.Abstractions;
@@ -27,6 +29,29 @@ public enum InFlightPolicy
 /// </remarks>
 public sealed class RequestInProgressException()
     : Exception("Another request with the same Idempotency-Key is still being processed.");
+
+/// <summary>
+/// Raised when an idempotency key that already has a recorded result is sent again with a different request.
+/// </summary>
+/// <remarks>
+/// A key names one request. Replaying the first answer for a different one would hand the caller an order or a result
+/// they did not ask for, so the API answers <c>422</c> <c>idempotency.key_reused</c> instead (QA P-06).
+/// </remarks>
+public sealed class IdempotencyKeyReusedException()
+    : Exception("This Idempotency-Key was already used for a different request.");
+
+/// <summary>A short, stable digest of what a request asked for, to tell a retry from a different request.</summary>
+public static class RequestFingerprint
+{
+    /// <summary>The digest of the given values, order-sensitive. Null and empty are the same value.</summary>
+    public static string Of(params object?[] parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+
+        var text = string.Join("|", parts.Select(part => Convert.ToString(part, System.Globalization.CultureInfo.InvariantCulture)?.Replace("|", "||", StringComparison.Ordinal) ?? string.Empty));
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..32];
+    }
+}
 
 /// <summary>
 /// The one call-site pattern every double-submit-sensitive handler uses on top of
@@ -78,7 +103,8 @@ public static class IdempotencyExtensions
         TimeSpan retention,
         Func<Task<T>> work,
         CancellationToken ct,
-        InFlightPolicy inFlight = InFlightPolicy.RunAgain)
+        InFlightPolicy inFlight = InFlightPolicy.RunAgain,
+        string? fingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentException.ThrowIfNullOrWhiteSpace(scope);
@@ -94,7 +120,7 @@ public static class IdempotencyExtensions
             var recorded = await store.GetRecordedResultAsync(scope, idempotencyKey, ct).ConfigureAwait(false);
             if (recorded is not null)
             {
-                return JsonSerializer.Deserialize<T>(recorded, SerializerOptions)!;
+                return Unwrap<T>(recorded, fingerprint);
             }
 
             if (inFlight == InFlightPolicy.Reject)
@@ -115,10 +141,43 @@ public static class IdempotencyExtensions
         }
 
         await store
-            .RecordResultAsync(scope, idempotencyKey, JsonSerializer.Serialize(result, SerializerOptions), ct)
+            .RecordResultAsync(scope, idempotencyKey, Wrap(result, fingerprint), ct)
             .ConfigureAwait(false);
 
         return result;
+    }
+
+    private const string FingerprintProperty = "koleksiFingerprint";
+    private const string ResultProperty = "result";
+
+    /// <summary>
+    /// The result as stored. With a fingerprint it travels in an envelope beside the result; without one it is stored as
+    /// before, so rows written by callers that do not fingerprint (and rows from before this existed) are unchanged.
+    /// </summary>
+    private static string Wrap<T>(T result, string? fingerprint)
+    {
+        var json = JsonSerializer.Serialize(result, SerializerOptions);
+        return fingerprint is null
+            ? json
+            : "{\"" + FingerprintProperty + "\":\"" + fingerprint + "\",\"" + ResultProperty + "\":" + json + "}";
+    }
+
+    private static T Unwrap<T>(string recorded, string? fingerprint)
+    {
+        using var document = JsonDocument.Parse(recorded);
+        if (document.RootElement.ValueKind == JsonValueKind.Object
+            && document.RootElement.TryGetProperty(FingerprintProperty, out var stored)
+            && document.RootElement.TryGetProperty(ResultProperty, out var result))
+        {
+            if (fingerprint is not null && !string.Equals(stored.GetString(), fingerprint, StringComparison.Ordinal))
+            {
+                throw new IdempotencyKeyReusedException();
+            }
+
+            return result.Deserialize<T>(SerializerOptions)!;
+        }
+
+        return JsonSerializer.Deserialize<T>(recorded, SerializerOptions)!;
     }
 
     /// <summary>

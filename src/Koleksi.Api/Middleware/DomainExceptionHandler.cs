@@ -1,3 +1,4 @@
+using Koleksi.Api.Security;
 using Koleksi.Application.Abstractions;
 using Koleksi.Domain.Common;
 using Microsoft.AspNetCore.Diagnostics;
@@ -118,11 +119,27 @@ public sealed partial class DomainExceptionHandler(
                 (StatusCodes.Status503ServiceUnavailable, "Temporarily unavailable",
                     "The resource is being updated by another request. Please retry.", "concurrency.conflict"),
 
+            // The key is already spent on a different request: replaying the first answer would be wrong (QA P-06).
+            IdempotencyKeyReusedException =>
+                (StatusCodes.Status422UnprocessableEntity, "Idempotency key reused",
+                    "This Idempotency-Key was already used for a different request. Use a new key.",
+                    "idempotency.key_reused"),
+
+            // A page cursor the store could not resume from: forged, edited, or taken from another list.
+            InvalidCursorException =>
+                (StatusCodes.Status400BadRequest, "Invalid request", "The page cursor is not valid.",
+                    "request.invalid_cursor"),
+
             // Argument guards indicate a malformed request that slipped past validation.
             // The message names a parameter, never a value, so nothing is echoed back.
             ArgumentException =>
                 (StatusCodes.Status400BadRequest, "Invalid request", "One or more values were not valid.",
                     "request.invalid"),
+
+            // A body past the cap (see RequestBodyLimitMiddleware) is its own answer, not a malformed one.
+            BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge } =>
+                (StatusCodes.Status413PayloadTooLarge, "Request body too large", "The request body is too large.",
+                    RequestBodyTooLargeException.Code),
 
             BadHttpRequestException =>
                 (StatusCodes.Status400BadRequest, "Invalid request", "The request could not be read.",
