@@ -213,6 +213,7 @@ internal static class ListingEndpoints
         IAuctionRepository auctions,
         IListingHoldStore holds,
         PublicIdentityResolver identities,
+        IMediaStorage media,
         string? cursor,
         CancellationToken ct)
     {
@@ -276,6 +277,7 @@ internal static class ListingEndpoints
                 SellerUsername = ownHandle,
                 listing.City,
                 PrimaryPhotoKey = listing.Photos.Count > 0 ? listing.Photos[0].StorageKey : null,
+                PrimaryPhotoUrl = media.OriginalUrl(listing.Photos.Count > 0 ? listing.Photos[0].StorageKey : null),
                 AuctionEndsAt = auctionEndsAt,
                 BidCount = bidCount,
                 listing.Stock,
@@ -330,6 +332,7 @@ internal static class ListingEndpoints
         ICurrentUser user,
         IListingRepository listings,
         IAuctionRepository auctions,
+        IMediaStorage media,
         CancellationToken ct)
     {
         var listing = await listings.FindAsync(id, ct).ConfigureAwait(false);
@@ -363,7 +366,13 @@ internal static class ListingEndpoints
             Status = listing.Status.ToString(),
             listing.Condition,
             listing.City,
-            Photos = listing.Photos.Select(photo => new { photo.StorageKey, photo.Width, photo.Height }),
+            Photos = listing.Photos.Select(photo => new
+            {
+                photo.StorageKey,
+                Url = media.OriginalUrl(photo.StorageKey),
+                photo.Width,
+                photo.Height,
+            }),
             listing.Stock,
             listing.AutoDeclineBelowPercent,
             listing.AuctionDurationDays,

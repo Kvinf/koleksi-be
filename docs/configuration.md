@@ -99,7 +99,6 @@ we do not control by editing one setting.
 | `KOLEKSI_API_URL` | **yes** | Server-side only. Throws at startup if absent, rather than producing fetches to `undefined/api/...`. |
 | `SESSION_SECRET` | **yes** | Signs the session cookie. At least 32 characters, or startup fails. Comma-separated to rotate: the first value signs, the rest still verify. Generate with `openssl rand -base64 48`. |
 | `KOLEKSI_API_TIMEOUT_MS` | no | Defaults to 8000. Deliberately below the Lambda timeout so a hang surfaces as a handled error page rather than a killed invocation. |
-| `VITE_MEDIA_BASE_URL` | no | CDN base for listing photo keys. `VITE_`-prefixed variables **are embedded in the client bundle** — never put a secret behind that prefix. |
 | `KOLEKSI_COGNITO_DOMAIN` | no | The pool's hosted-UI base URL, e.g. `https://koleksi-dev.auth.ap-southeast-3.amazoncognito.com`. Needed to build the Cognito authorize URL. Not a secret — it is a public endpoint, the same value as the backend's `Cognito:HostedUiDomain`. Absent means "Continue with Google" redirects back to sign-in with a message instead of to Cognito. |
 | `KOLEKSI_COGNITO_CLIENT_ID` | no | The pool's web app client id. Not a secret — Google's own guidance says a public client's id is safe to embed; PKCE, not this value, is what protects the exchange. |
 

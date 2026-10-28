@@ -1,3 +1,4 @@
+using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Watchlist;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -40,7 +41,7 @@ internal static class WatchlistEndpoints
     }
 
     private static async Task<IResult> GetWatchlistAsync(
-        GetWatchlistHandler handler, int? page, int? size, CancellationToken ct)
+        GetWatchlistHandler handler, IMediaStorage media, int? page, int? size, CancellationToken ct)
     {
         var result = await handler
             .HandleAsync(page ?? 1, size ?? GetWatchlistHandler.DefaultPageSize, ct)
@@ -61,6 +62,7 @@ internal static class WatchlistEndpoints
                 view.Listing.SellerUsername,
                 view.Listing.City,
                 view.Listing.PrimaryPhotoKey,
+                PrimaryPhotoUrl = media.OriginalUrl(view.Listing.PrimaryPhotoKey),
                 view.Listing.AuctionEndsAt,
                 view.Listing.BidCount,
                 view.SavedAt,

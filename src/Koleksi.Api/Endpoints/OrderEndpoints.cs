@@ -130,6 +130,7 @@ internal static class OrderEndpoints
         IOrderRepository orders,
         PublicIdentityResolver identities,
         IDeliveryTracker tracker,
+        IMediaStorage media,
         CancellationToken ct)
     {
         var order = await orders.FindAsync(orderId, ct).ConfigureAwait(false);
@@ -153,7 +154,7 @@ internal static class OrderEndpoints
         // same derivation, just returned instead of applied. It is also on the order itself,
         // so a row and its detail read alike.
         var handles = await HandlesAsync(identities, [order], ct).ConfigureAwait(false);
-        return Results.Ok(new { order = ToOrderDetail(order, viewerRole, handles, tracker.IsConfigured), viewerRole });
+        return Results.Ok(new { order = ToOrderDetail(order, viewerRole, handles, tracker.IsConfigured, media), viewerRole });
     }
 
     private static async Task<IResult> ListMyOrdersAsync(
@@ -287,6 +288,7 @@ internal static class OrderEndpoints
         IOrderRepository orders,
         PublicIdentityResolver identities,
         IDeliveryTracker tracker,
+        IMediaStorage media,
         ICurrentUser user,
         IIdempotencyStore idempotency,
         HttpRequest http,
@@ -318,7 +320,7 @@ internal static class OrderEndpoints
         var handles = await HandlesAsync(identities, [order], ct).ConfigureAwait(false);
         return Results.Ok(new
         {
-            order = ToOrderDetail(order, viewerRole, handles, tracker.IsConfigured),
+            order = ToOrderDetail(order, viewerRole, handles, tracker.IsConfigured, media),
             viewerRole,
             escrowState = order.EscrowState.ToString(),
         });
@@ -375,7 +377,7 @@ internal static class OrderEndpoints
     }
 
     private static object ToOrderDetail(
-        Order order, string viewerRole, IReadOnlyDictionary<string, PublicProfile> handles, bool courierTracking) => new
+        Order order, string viewerRole, IReadOnlyDictionary<string, PublicProfile> handles, bool courierTracking, IMediaStorage media) => new
     {
         order.Id,
         order.OrderNumber,
@@ -387,6 +389,7 @@ internal static class OrderEndpoints
             line.ListingId,
             line.Title,
             line.PhotoKey,
+            photoUrl = media.OriginalUrl(line.PhotoKey),
             unitPriceRupiah = line.UnitPrice.Rupiah,
             line.Quantity,
         }),

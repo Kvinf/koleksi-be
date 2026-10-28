@@ -103,13 +103,13 @@ internal static class ConversationEndpoints
     }
 
     private static async Task<IResult> ListConversationsAsync(
-        ListConversationsHandler handler, ICurrentUser user, PublicIdentityResolver identities, CancellationToken ct)
+        ListConversationsHandler handler, ICurrentUser user, PublicIdentityResolver identities, IMediaStorage media, CancellationToken ct)
     {
         var viewerId = user.RequireUserId();
         var conversations = await handler.HandleAsync(ct).ConfigureAwait(false);
 
         var names = await ResolveOtherPartiesAsync(identities, conversations, viewerId, ct).ConfigureAwait(false);
-        var items = conversations.Select(conversation => ToSummary(conversation, viewerId, names)).ToList();
+        var items = conversations.Select(conversation => ToSummary(conversation, viewerId, names, media)).ToList();
 
         return Results.Ok(new { items, totalUnread = conversations.Sum(c => c.UnreadFor(viewerId)) });
     }
@@ -120,9 +120,10 @@ internal static class ConversationEndpoints
         GetConversationHandler handler,
         ICurrentUser user,
         PublicIdentityResolver identities,
+        IMediaStorage media,
         CancellationToken ct) =>
         await ToThreadResultAsync(
-            await handler.HandleAsync(conversationId, limit, ct).ConfigureAwait(false), user, identities, ct)
+            await handler.HandleAsync(conversationId, limit, ct).ConfigureAwait(false), user, identities, media, ct)
             .ConfigureAwait(false);
 
     private static async Task<IResult> GetListingConversationAsync(
@@ -131,13 +132,14 @@ internal static class ConversationEndpoints
         GetConversationHandler handler,
         ICurrentUser user,
         PublicIdentityResolver identities,
+        IMediaStorage media,
         CancellationToken ct) =>
         await ToThreadResultAsync(
-            await handler.HandleForListingAsync(listingId, limit, ct).ConfigureAwait(false), user, identities, ct)
+            await handler.HandleForListingAsync(listingId, limit, ct).ConfigureAwait(false), user, identities, media, ct)
             .ConfigureAwait(false);
 
     private static async Task<IResult> ToThreadResultAsync(
-        ConversationThread? thread, ICurrentUser user, PublicIdentityResolver identities, CancellationToken ct)
+        ConversationThread? thread, ICurrentUser user, PublicIdentityResolver identities, IMediaStorage media, CancellationToken ct)
     {
         if (thread is null)
         {
@@ -149,7 +151,7 @@ internal static class ConversationEndpoints
 
         return Results.Ok(new
         {
-            conversation = ToSummary(thread.Conversation, viewerId, names),
+            conversation = ToSummary(thread.Conversation, viewerId, names, media),
             viewerRole = thread.ViewerRole.ToString(),
             messages = thread.Messages.Select(message => new
             {
@@ -185,12 +187,13 @@ internal static class ConversationEndpoints
             .ConfigureAwait(false);
 
     private static object ToSummary(
-        Conversation conversation, string viewerId, IReadOnlyDictionary<string, PublicProfile> names) => new
+        Conversation conversation, string viewerId, IReadOnlyDictionary<string, PublicProfile> names, IMediaStorage media) => new
     {
         conversation.Id,
         conversation.ListingId,
         conversation.ListingTitle,
         conversation.ListingPhotoKey,
+        listingPhotoUrl = media.OriginalUrl(conversation.ListingPhotoKey),
         otherPartyUsername = names[OtherPartyId(conversation, viewerId)].ShownName,
         unread = conversation.UnreadFor(viewerId),
         lastMessagePreview = conversation.LastMessagePreview,

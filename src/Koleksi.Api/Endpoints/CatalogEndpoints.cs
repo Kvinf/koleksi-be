@@ -62,6 +62,7 @@ internal static class CatalogEndpoints
     private static async Task<IResult> SuggestAsync(
         HttpContext context,
         SuggestSearchHandler handler,
+        IMediaStorage media,
         [FromQuery(Name = "q")] string? text,
         CancellationToken ct)
     {
@@ -85,6 +86,7 @@ internal static class CatalogEndpoints
                 item.PriceRupiah,
                 format = item.Format.ToString(),
                 item.PhotoKey,
+                PhotoUrl = media.OriginalUrl(item.PhotoKey),
             }),
         });
     }
@@ -124,6 +126,7 @@ internal static class CatalogEndpoints
     private static async Task<IResult> BrowseAsync(
         HttpContext context,
         BrowseListingsHandler handler,
+        IMediaStorage media,
         [FromQuery(Name = "kategori")] string? categorySlug,
         [FromQuery(Name = "q")] string? searchTerm,
         [FromQuery(Name = "kota")] string? city,
@@ -164,7 +167,7 @@ internal static class CatalogEndpoints
 
         return Results.Ok(new
         {
-            items = result.Page.Items,
+            items = result.Page.Items.Select(item => item.ToResponse(media)),
             page = new
             {
                 number = result.Page.PageNumber,

@@ -77,6 +77,7 @@ internal static class SellerEndpoints
         [FromQuery(Name = "kind")] string? kind,
         [FromQuery(Name = "cursor")] string? cursor,
         ListSellerListingsHandler handler,
+        IMediaStorage media,
         HttpContext context,
         CancellationToken ct)
     {
@@ -91,7 +92,7 @@ internal static class SellerEndpoints
         }
 
         MarkPubliclyCacheable(context);
-        return Results.Ok(new { items = page.Items, nextCursor = page.NextCursor });
+        return Results.Ok(new { items = page.Items.Select(item => item.ToResponse(media)), nextCursor = page.NextCursor });
     }
 
     private static async Task<IResult> GetReviewsAsync(

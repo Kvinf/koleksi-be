@@ -91,12 +91,12 @@ internal static class OfferEndpoints
             $"offer.withdraw:{user.RequireUserId()}:{offerId}", Read(http), IdempotencyRetention, () => handler.HandleAsync(offerId, ct), ct)
             .ConfigureAwait(false));
 
-    private static async Task<IResult> GetOfferAsync(string offerId, OfferViews views, CancellationToken ct)
+    private static async Task<IResult> GetOfferAsync(string offerId, OfferViews views, IMediaStorage media, CancellationToken ct)
     {
         // Same coarse answer for "does not exist" and "not yours" — same reasoning
         // OrderEndpoints.GetOrderAsync uses.
         var view = await views.GetAsync(offerId, ct).ConfigureAwait(false);
-        return view is null ? Results.NotFound(new { code = "offer.not_found" }) : Results.Ok(ToOfferRow(view));
+        return view is null ? Results.NotFound(new { code = "offer.not_found" }) : Results.Ok(ToOfferRow(view, media));
     }
 
     private static IResult ToResult(OfferOutcome outcome) => outcome.Found
@@ -109,28 +109,29 @@ internal static class OfferEndpoints
         })
         : Results.NotFound(new { code = "offer.not_found" });
 
-    private static async Task<IResult> ListMyOffersAsync(OfferViews views, string? cursor, CancellationToken ct)
+    private static async Task<IResult> ListMyOffersAsync(OfferViews views, IMediaStorage media, string? cursor, CancellationToken ct)
     {
         var page = await views.ListSentAsync(cursor, ct).ConfigureAwait(false);
-        return Results.Ok(new { items = page.Items.Select(ToOfferRow), nextCursor = page.NextCursor });
+        return Results.Ok(new { items = page.Items.Select(view => ToOfferRow(view, media)), nextCursor = page.NextCursor });
     }
 
-    private static async Task<IResult> ListReceivedOffersAsync(OfferViews views, string? cursor, CancellationToken ct)
+    private static async Task<IResult> ListReceivedOffersAsync(OfferViews views, IMediaStorage media, string? cursor, CancellationToken ct)
     {
         var page = await views.ListReceivedAsync(cursor, ct).ConfigureAwait(false);
-        return Results.Ok(new { items = page.Items.Select(ToOfferRow), nextCursor = page.NextCursor });
+        return Results.Ok(new { items = page.Items.Select(view => ToOfferRow(view, media)), nextCursor = page.NextCursor });
     }
 
     /// <summary>
     /// One offer as its viewer sees it. No user id appears: each party is named by handle,
     /// and the viewer's own side is stated as <c>viewerRole</c>.
     /// </summary>
-    private static object ToOfferRow(OfferView view) => new
+    private static object ToOfferRow(OfferView view, IMediaStorage media) => new
     {
         view.Offer.Id,
         view.Offer.ListingId,
         listingTitle = view.ListingTitle,
         listingPhotoKey = view.ListingPhotoKey,
+        listingPhotoUrl = media.OriginalUrl(view.ListingPhotoKey),
         categorySlug = view.CategorySlug,
         viewerRole = view.ViewerRole == OfferParty.Buyer ? "buyer" : "seller",
         sellerUsername = view.SellerHandle,
