@@ -1,13 +1,13 @@
 name: CI
 
-# Builds and tests every pull request and every push to main. A push to main that passes also asks the infra repository
+# Builds and tests every pull request and every push to main or dev. A push to dev that passes also asks the infra repository
 # to deploy the dev stage (the `request-deploy` job); the deploy itself, its AWS sign-in and its safety checks live there,
 # in koleksi-infra/.github/workflows/deploy-dev.yml. See koleksi-infra/docs/ci-cd.md.
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
@@ -58,7 +58,7 @@ jobs:
 
   request-deploy:
     needs: check
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
