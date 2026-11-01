@@ -49,15 +49,25 @@ internal static class AuctionEndpoints
         string listingId,
         PlaceBidRequest request,
         PlaceBidHandler handler,
+        ICurrentUser user,
+        IIdempotencyStore idempotency,
+        HttpRequest http,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
 
         // The listing comes from the route and the bidder from the token. The body carries
         // one number and nothing else, so there is no field in it worth forging.
-        var result = await handler
-            .HandleAsync(new PlaceBidCommand(listingId, request.AmountRupiah), ct)
-            .ConfigureAwait(false);
+        // A retry or double-tap with the same key replays the first answer instead of placing a
+        // second bid (and a second outbid notification). No key, no protection.
+        var result = await idempotency.RunOnceAsync(
+            $"auction.bid:{user.RequireUserId()}:{listingId}",
+            IdempotencyHeader.Read(http),
+            TimeSpan.FromMinutes(2),
+            () => handler.HandleAsync(new PlaceBidCommand(listingId, request.AmountRupiah), ct),
+            ct,
+            inFlight: InFlightPolicy.Reject,
+            fingerprint: RequestFingerprint.Of(request.AmountRupiah)).ConfigureAwait(false);
 
         if (!result.Found)
         {

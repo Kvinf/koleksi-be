@@ -62,6 +62,34 @@ public sealed class ConcurrencyAndIdempotencyTests(KoleksiApiFactory factory) : 
         stored.Items.Count(o => o.ListingId == listing.Id).ShouldBe(1);
     }
 
+    [Fact]
+    public async Task An_offer_sent_twice_with_one_key_makes_one_offer_and_replays_its_id()
+    {
+        var listing = TestData.ActiveListing(price: Money.FromRupiah(3_000_000), format: ListingFormat.AcceptOffers);
+        factory.Listings.Seed(listing);
+        using var client = factory.CreateClientAs(TestData.BidderId, TestData.BidderUsername);
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostOfferAsync(client, listing.Id, 2_000_000, key);
+        using var second = await PostOfferAsync(client, listing.Id, 2_000_000, key);
+
+        // Run again, the second would be refused as offer.already_active.
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+        second.StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await second.ReadJsonAsync()).GetProperty("offerId").GetString()
+            .ShouldBe((await first.ReadJsonAsync()).GetProperty("offerId").GetString());
+    }
+
+    private static Task<HttpResponseMessage> PostOfferAsync(HttpClient client, string listingId, long amountRupiah, string key)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, $"/api/listings/{listingId}/offers")
+        {
+            Content = JsonContent.Create(new { amountRupiah }),
+        };
+        request.Headers.Add("Idempotency-Key", key);
+        return client.SendAsync(request);
+    }
+
     // ---- N-03 / D-06: a key that is claimed but has no result yet ----------------------------------
 
     [Fact]

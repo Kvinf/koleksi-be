@@ -340,6 +340,52 @@ public sealed class AuctionEndpointTests(KoleksiApiFactory factory) : IClassFixt
         (await response.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("auction.seller_cannot_bid");
     }
 
+    [Fact]
+    public async Task A_bid_sent_twice_with_one_key_is_placed_once_and_the_second_gets_the_first_answer()
+    {
+        var (listingId, _) = Seed();
+        using var client = factory.CreateClientAs(Guid.NewGuid().ToString(), "idempotentBidder");
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostKeyedBidAsync(client, listingId, 4_000_000, key);
+        using var second = await PostKeyedBidAsync(client, listingId, 4_000_000, key);
+
+        // Run again, the second bid would be refused for not clearing the new minimum.
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+        second.StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await second.Content.ReadAsStringAsync()).ShouldBe(await first.Content.ReadAsStringAsync());
+
+        var auction = await factory.Auctions.FindAsync(listingId, CancellationToken.None);
+        auction.ShouldNotBeNull();
+        auction.BidCount.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task A_bid_key_reused_for_a_different_amount_is_refused()
+    {
+        var (listingId, _) = Seed();
+        using var client = factory.CreateClientAs(Guid.NewGuid().ToString(), "keyReuseBidder");
+        var key = Guid.NewGuid().ToString();
+
+        using var first = await PostKeyedBidAsync(client, listingId, 4_000_000, key);
+        first.StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        using var second = await PostKeyedBidAsync(client, listingId, 5_000_000, key);
+
+        second.StatusCode.ShouldBe(HttpStatusCode.UnprocessableEntity);
+        (await second.ReadJsonAsync()).GetProperty("code").GetString().ShouldBe("idempotency.key_reused");
+    }
+
+    private static Task<HttpResponseMessage> PostKeyedBidAsync(HttpClient client, string listingId, long amountRupiah, string key)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, $"/api/auctions/{listingId}/bids")
+        {
+            Content = System.Net.Http.Json.JsonContent.Create(new { amountRupiah }),
+        };
+        request.Headers.Add("Idempotency-Key", key);
+        return client.SendAsync(request);
+    }
+
     /// <summary>Seeds a live auction listing and returns its id alongside the listing.</summary>
     private (string ListingId, Listing Listing) Seed(Money? reservePrice = null, Money? buyoutPrice = null)
     {

@@ -39,13 +39,25 @@ internal static class OfferEndpoints
     }
 
     private static async Task<IResult> MakeOfferAsync(
-        string listingId, MakeOfferRequest request, MakeOfferHandler handler, CancellationToken ct)
+        string listingId,
+        MakeOfferRequest request,
+        MakeOfferHandler handler,
+        ICurrentUser user,
+        IIdempotencyStore idempotency,
+        HttpRequest http,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var result = await handler
-            .HandleAsync(new MakeOfferCommand(listingId, request.AmountRupiah, request.Message), ct)
-            .ConfigureAwait(false);
+        // A double-tap on "Send offer" replays the first offer instead of creating a second one.
+        var result = await idempotency.RunOnceAsync(
+            $"offer.make:{user.RequireUserId()}:{listingId}",
+            Read(http),
+            IdempotencyRetention,
+            () => handler.HandleAsync(new MakeOfferCommand(listingId, request.AmountRupiah, request.Message), ct),
+            ct,
+            InFlightPolicy.Reject,
+            RequestFingerprint.Of(request.AmountRupiah, request.Message)).ConfigureAwait(false);
 
         return result.Found
             ? Results.Ok(new { offerId = result.OfferId, status = result.Status.ToString(), result.ExpiresAt })
