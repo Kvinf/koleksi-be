@@ -177,7 +177,8 @@ builder.Services.AddRateLimiter(options =>
         // serve; the per-route limits on sign-in, bidding, checkout and the rest are unchanged.
         if (HttpMethods.IsGet(context.Request.Method)
             && (context.Request.Path.StartsWithSegments("/api/catalog", StringComparison.OrdinalIgnoreCase)
-                || context.Request.Path.StartsWithSegments("/api/sellers", StringComparison.OrdinalIgnoreCase)))
+                || context.Request.Path.StartsWithSegments("/api/sellers", StringComparison.OrdinalIgnoreCase)
+                || context.Request.Path.StartsWithSegments("/api/bounties", StringComparison.OrdinalIgnoreCase)))
         {
             return RateLimitPartition.GetTokenBucketLimiter(
                 "catalog:" + (context.Connection.RemoteIpAddress?.ToString() ?? "unknown"),
@@ -533,6 +534,7 @@ app.MapProfileEndpoints();
 app.MapMediaEndpoints();
 app.MapListingEndpoints();
 app.MapOfferEndpoints();
+app.MapBountyEndpoints();
 app.MapConversationEndpoints();
 app.MapRealtimeEndpoints();
 app.MapOrderEndpoints();

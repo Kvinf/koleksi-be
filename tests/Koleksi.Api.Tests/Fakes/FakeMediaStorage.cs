@@ -33,11 +33,12 @@ public sealed class FakeMediaStorage : FakeAdapter, IMediaStorage
     }
 
     public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
-        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct)
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct,
+        MediaPurpose purpose = MediaPurpose.ListingPhoto)
     {
         ThrowIfFailing();
 
-        var key = $"listings/{ownerId}/test-object";
+        var key = $"{MediaKeys.PrefixFor(purpose)}/{ownerId}/test-object";
         UploadGrant Grant(string suffix, string contentType) => new(
             $"{key}/{suffix}",
             new Uri($"{CdnBase}/upload/{key}/{suffix}"),

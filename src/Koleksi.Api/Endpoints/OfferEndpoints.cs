@@ -158,6 +158,9 @@ internal static class OfferEndpoints
         view.Offer.CreatedAt,
         view.Offer.ExpiresAt,
         view.OrderId,
+        origin = view.Offer.Origin.ToString(),
+        bountyId = view.Offer.BountyId,
+        bountyCode = view.Offer.BountyId is null ? null : Koleksi.Domain.Bounties.BountyCode.For(view.Offer.BountyId),
         view.CanCheckout,
     };
 

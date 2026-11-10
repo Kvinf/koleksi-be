@@ -39,9 +39,15 @@ public static class AdminCapabilities
 
     public const string HolidaysEdit = "admin.holidays.edit";
 
+    /// <summary>List and open reported Dicari.</summary>
+    public const string BountiesRead = "admin.bounties.read";
+
+    /// <summary>Take a Dicari down, or leave it up and clear its reports.</summary>
+    public const string BountiesModerate = "admin.bounties.moderate";
+
     public static IReadOnlyList<string> All { get; } =
     [
-        SessionStart, AuditRead, OverviewRead, DisputesRead, DisputesNote, DisputesResolve, HolidaysRead, HolidaysEdit,
+        SessionStart, AuditRead, OverviewRead, DisputesRead, DisputesNote, DisputesResolve, HolidaysRead, HolidaysEdit, BountiesRead, BountiesModerate,
     ];
 }
 

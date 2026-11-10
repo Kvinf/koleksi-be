@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Bounties;
 using Koleksi.Application.Features.Standing;
 using Koleksi.Domain.Common;
 using Koleksi.Domain.Orders;
@@ -35,7 +36,8 @@ public sealed partial class CancelUnpaidOrdersHandler(
     IListingHoldStore holds,
     AccountStandingService standing,
     IClock clock,
-    ILogger<CancelUnpaidOrdersHandler> logger)
+    ILogger<CancelUnpaidOrdersHandler> logger,
+    BountyDeals? bountyDeals = null)
 {
     /// <summary>How long after the payment window closes an unpaid order is left before it is cancelled.</summary>
     public static readonly TimeSpan Grace = TimeSpan.FromMinutes(10);
@@ -96,6 +98,11 @@ public sealed partial class CancelUnpaidOrdersHandler(
 
             // An accepted nego deal or an auction win that was never paid for is a broken commitment.
             await OrderViolations.RecordIfCommitmentAsync(standing, order, ct).ConfigureAwait(false);
+
+            if (bountyDeals is not null)
+            {
+                await bountyDeals.ReleaseAfterOrderDiedAsync(order, ct).ConfigureAwait(false);
+            }
         }
 
         LogSummary(logger, due.Count, cancelled, skipped, errors);

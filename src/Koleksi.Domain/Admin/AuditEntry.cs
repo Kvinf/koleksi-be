@@ -194,6 +194,12 @@ public static class AuditActions
     /// <summary>Staff read the order's private chat while reviewing a case.</summary>
     public const string DisputeChatViewed = "dispute.chat_viewed";
 
+    /// <summary>Staff took a Dicari down, with a reason.</summary>
+    public const string BountyRemoved = "bounty.removed";
+
+    /// <summary>Staff looked at the reports on a Dicari and left it up.</summary>
+    public const string BountyReportsDismissed = "bounty.reports_dismissed";
+
     public const string HolidayAdded = "holiday.added";
 
     public const string HolidayRemoved = "holiday.removed";
@@ -211,4 +217,6 @@ public static class AuditTargets
     public const string Order = "order";
 
     public const string Holiday = "holiday";
+
+    public const string Bounty = "bounty";
 }

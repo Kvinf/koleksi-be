@@ -137,5 +137,5 @@ public sealed class FakeOrderRepository : FakeAdapter, IOrderRepository
         order.Id, order.OrderNumber, order.BuyerId, order.SellerId, order.Lines, order.ShipTo, order.Courier,
         order.EscrowState, order.Shipment, order.Dispute, order.CreatedAt, order.PaidAt, order.ShippedAt,
         order.DeliveredAt, order.ReleasedAt, order.Version, order.FeePercentSnapshot,
-        order.Source, order.PaymentDueAt, order.TrackingCheckedAt, order.SourceReference);
+        order.Source, order.PaymentDueAt, order.TrackingCheckedAt, order.SourceReference, order.BountyId);
 }

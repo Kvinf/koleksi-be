@@ -60,7 +60,8 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
     }
 
     public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
-        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct)
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct,
+        MediaPurpose purpose = MediaPurpose.ListingPhoto)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         ArgumentNullException.ThrowIfNull(original);
@@ -76,7 +77,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
         ValidateUploadSize(large.ContentLength);
         ValidateUploadSize(small.ContentLength);
 
-        var key = BuildKey(MediaPurpose.ListingPhoto, ownerId, extension: string.Empty);
+        var key = BuildKey(purpose, ownerId, extension: string.Empty);
 
         return Task.FromResult(new PhotoUploadGrantSet(
             StorageKey: key,
@@ -127,7 +128,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
 
-        if (PurposeFromKey(storageKey) != MediaPurpose.ListingPhoto)
+        if (PurposeFromKey(storageKey) is not { } photoSetPurpose || !MediaKeys.IsPhotoSet(photoSetPurpose))
         {
             return Task.FromResult(false);
         }
@@ -163,7 +164,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
             throw new InvalidOperationException("Identity documents are never served publicly.");
         }
 
-        var key = purpose == MediaPurpose.ListingPhoto && !MediaKeys.IsLegacyListingPhotoKey(storageKey)
+        var key = purpose is { } photoPurpose && MediaKeys.IsPhotoSet(photoPurpose) && !MediaKeys.IsLegacyListingPhotoKey(storageKey)
             ? $"{storageKey}/{SizeSegment(size)}"
             : storageKey;
 
@@ -213,6 +214,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
             MediaPurpose.ShippingProof => "shipping",
             MediaPurpose.ReviewPhoto => "reviews",
             MediaPurpose.IdentityDocument => "identity",
+            MediaPurpose.BountyPhoto => "bounties",
             _ => throw new ArgumentOutOfRangeException(nameof(purpose)),
         };
 
@@ -229,6 +231,7 @@ internal sealed class LocalMediaStorage(IHttpContextAccessor httpContextAccessor
             "shipping" => MediaPurpose.ShippingProof,
             "reviews" => MediaPurpose.ReviewPhoto,
             "identity" => MediaPurpose.IdentityDocument,
+            "bounties" => MediaPurpose.BountyPhoto,
             _ => null,
         };
 

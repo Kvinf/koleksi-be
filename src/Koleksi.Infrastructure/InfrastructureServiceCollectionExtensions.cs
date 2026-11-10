@@ -67,6 +67,8 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IListingRepository, DynamoListingRepository>();
         services.AddSingleton<IAuctionRepository, DynamoAuctionRepository>();
         services.AddSingleton<IOfferRepository, DynamoOfferRepository>();
+        services.AddSingleton<IBountyRepository, DynamoBountyRepository>();
+        services.AddSingleton<IBountyModerationStore, DynamoBountyModerationStore>();
         services.AddSingleton<IConversationRepository, DynamoConversationRepository>();
         services.AddSingleton<IOrderRepository, DynamoOrderRepository>();
         services.AddSingleton<IOrderSweepBackfill, DynamoOrderRepository>();
@@ -159,6 +161,10 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IConversationRepository, DynamoConversationRepository>();
         services.AddSingleton<IDisputeAdminStore, DynamoDisputeAdminStore>();
         services.AddSingleton<IHolidayStore, DynamoHolidayStore>();
+
+        // Reported Dicari: the Dicari are read through the public repository, and the moderation store is the admin site's writer.
+        services.AddSingleton<IBountyRepository, DynamoBountyRepository>();
+        services.AddSingleton<IBountyModerationStore, DynamoBountyModerationStore>();
 
         // No payment gateway exists, so no refund sender moves money. The development switch picks the stand-in that says so differently.
         if (options.Simulators.Enabled)

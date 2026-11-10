@@ -30,4 +30,11 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <!-- The Dicari fakes are the ones Koleksi.Api.Tests uses; linked rather than copied so there is one behaviour to keep true. -->
+  <ItemGroup>
+    <Compile Include="..\Koleksi.Api.Tests\Fakes\FakeAdapter.cs" Link="Fakes\FakeAdapter.cs" />
+    <Compile Include="..\Koleksi.Api.Tests\Fakes\FakeBountyRepository.cs" Link="Fakes\FakeBountyRepository.cs" />
+    <Compile Include="..\Koleksi.Api.Tests\Fakes\FakeBountyModerationStore.cs" Link="Fakes\FakeBountyModerationStore.cs" />
+  </ItemGroup>
+
 </Project>

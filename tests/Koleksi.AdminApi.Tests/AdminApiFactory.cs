@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using Koleksi.Application.Abstractions;
+using Koleksi.Api.Tests.Fakes;
 using Koleksi.Domain.Admin;
 using Koleksi.Domain.Common;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -80,10 +81,15 @@ public sealed class AdminApiFactory : WebApplicationFactory<Program>
 
     public FakeRefundSender Refunds { get; } = new();
 
+    public FakeBountyRepository Bounties { get; } = new();
+
+    public FakeBountyModerationStore BountyReports { get; }
+
     public AdminApiFactory()
     {
         Disputes = new FakeDisputeStore(Orders, Audit);
         Holidays = new FakeHolidayStore(Audit);
+        BountyReports = new FakeBountyModerationStore(Bounties, entry => Audit.AppendAsync(entry, CancellationToken.None).GetAwaiter().GetResult());
         foreach (var (year, seed) in HolidaySeed.ByYear)
         {
             Holidays.Preload(year, seed);
@@ -137,6 +143,8 @@ public sealed class AdminApiFactory : WebApplicationFactory<Program>
             Replace<IPublicProfileRepository>(services, Profiles);
             Replace<IConversationRepository>(services, Conversations);
             Replace<IRefundSender>(services, Refunds);
+            Replace<IBountyRepository>(services, Bounties);
+            Replace<IBountyModerationStore>(services, BountyReports);
         });
     }
 

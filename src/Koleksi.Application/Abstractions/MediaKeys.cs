@@ -34,6 +34,7 @@ public static class MediaKeys
         MediaPurpose.ShippingProof => "shipping",
         MediaPurpose.ReviewPhoto => "reviews",
         MediaPurpose.IdentityDocument => "identity",
+        MediaPurpose.BountyPhoto => "bounties",
         _ => throw new ArgumentOutOfRangeException(nameof(purpose)),
     };
 
@@ -82,7 +83,7 @@ public static class MediaKeys
             return false;
         }
 
-        return purpose == MediaPurpose.ListingPhoto
+        return IsPhotoSet(purpose)
             ? await media.VerifyPhotoUploadedAsync(storageKey!, ct).ConfigureAwait(false)
             : await media.VerifyUploadedAsync(storageKey!, ct).ConfigureAwait(false);
     }
@@ -104,6 +105,9 @@ public static class MediaKeys
         return storageKey.StartsWith(PrefixFor(MediaPurpose.ListingPhoto) + "/", StringComparison.Ordinal)
             && storageKey.IndexOf('.', lastSlash + 1) >= 0;
     }
+
+    /// <summary>Whether keys of this purpose are a prefix shared by the original, large and small objects.</summary>
+    public static bool IsPhotoSet(MediaPurpose purpose) => purpose is MediaPurpose.ListingPhoto or MediaPurpose.BountyPhoto;
 
     private static bool IsPlainSegment(string segment) =>
         segment.Length > 0

@@ -61,7 +61,8 @@ public interface IMediaStorage
     /// that would otherwise need their own correlated key.
     /// </remarks>
     Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
-        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct);
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct,
+        MediaPurpose purpose = MediaPurpose.ListingPhoto);
 
     /// <summary>
     /// Confirms an object exists, is within limits, and really is the image type it claimed.
@@ -130,6 +131,9 @@ public enum MediaPurpose
     /// reach — these are never served publicly under any circumstances.
     /// </summary>
     IdentityDocument = 4,
+
+    /// <summary>A Dicari (bounty) reference photo. Stored like a listing photo: one key prefix, three sizes.</summary>
+    BountyPhoto = 5,
 }
 
 /// <summary>A grant to upload exactly one object.</summary>

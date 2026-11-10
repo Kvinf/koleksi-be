@@ -207,6 +207,74 @@ internal static class DynamoTable
     /// <summary>The prefix shared by every active-offer pointer in a listing's partition.</summary>
     public static string OfferActiveSkPrefix() => OfferActiveSuffix;
 
+    // ─── Dicari (bounties) ──────────────────────────────────────────────────────
+    //
+    // A bounty and its proposals share one partition (BOUNTY#{id}) so a proposal and the count it advances can be written
+    // in one transaction. No new index: the board rides gsi_browse_new, the sweep rides gsi_auction_end, a buyer's own
+    // Dicari ride gsi_buyer and a seller's proposals ride gsi_seller, each under a prefix no other item uses.
+
+    private const string BountyPrefix = "BOUNTY#";
+    private const string BountyProposalSkPrefix = "PROPOSAL#";
+    private const string BountyProposerSkPrefix = "PROPOSER#";
+    private const string BountyOpenPrefix = "BOUNTYOPEN#";
+    private const string BountyDuePrefix = "BOUNTYDUE#";
+    private const string BountyProposalIndexPrefixValue = "BOUNTYPROPOSAL#";
+
+    public static string BountyPk(string bountyId) => BountyPrefix + Require(bountyId);
+
+    public static string BountyMetaSk() => MetaSuffix;
+
+    /// <summary>A proposal's sort key in its bounty's partition. Proposal ids are time-ordered, so a partition read is oldest first.</summary>
+    public static string BountyProposalSk(string proposalId) => BountyProposalSkPrefix + Require(proposalId);
+
+    public static string BountyProposalSkPrefixValue() => BountyProposalSkPrefix;
+
+    /// <summary>
+    /// The row that makes "one proposal per seller per Dicari" a condition on a write: it names the seller's live
+    /// proposal and is deleted when that proposal is withdrawn or lapses, which frees the seller to propose again.
+    /// </summary>
+    public static string BountyProposerSk(string sellerId) => BountyProposerSkPrefix + Require(sellerId);
+
+    /// <summary>Board partition for one category in <see cref="BrowseNewestIndex"/>: open Dicari only, newest first by id.</summary>
+    public static string BountyOpenPkValue(string categoryId) => BountyOpenPrefix + Require(categoryId);
+
+    public static string BountyOpenSkValue(string bountyId) => Require(bountyId);
+
+    /// <summary>Type-prefix for a Dicari's row in <see cref="BuyerIndex"/>.</summary>
+    public static string BountyIndexPrefix() => BountyPrefix;
+
+    /// <summary>Type-prefix for a proposal's row in <see cref="SellerIndex"/>.</summary>
+    public static string BountyProposalIndexPrefix() => BountyProposalIndexPrefixValue;
+
+    /// <summary>
+    /// Partition, in the sparse <see cref="AuctionEndIndex"/>, of open Dicari waiting on a clock (their deadline, or the
+    /// deadline of a deal in flight): one shard of <see cref="ShardOf"/> the bounty id. Rides the same index orders do, under
+    /// a prefix no auction or order partition shares.
+    /// </summary>
+    public static string BountyDuePkValue(int shard) =>
+        BountyDuePrefix + shard.ToString(CultureInfo.InvariantCulture);
+
+    public static string BountyDueSkValue(DateTimeOffset dueAt, string bountyId) =>
+        $"{FormatInstant(dueAt)}#{Require(bountyId)}";
+
+    private const string BountyReportSkPrefix = "REPORT#";
+    private const string BountyReportQueuePk = "BOUNTYREPORT#queue";
+
+    /// <summary>A report's sort key in its Dicari's partition. One per reporter, so a person cannot report twice.</summary>
+    public static string BountyReportSk(string reporterId) => BountyReportSkPrefix + Require(reporterId);
+
+    public static string BountyReportSkPrefixValue() => BountyReportSkPrefix;
+
+    /// <summary>
+    /// The staff queue of reported Dicari, in <see cref="AuctionEndIndex"/> under a prefix nothing else uses. One partition
+    /// on purpose: it only ever holds the reports nobody has settled (at most <c>BountyReport.MaxPerBounty</c> per Dicari),
+    /// and staff read it newest first.
+    /// </summary>
+    public static string BountyReportQueuePkValue() => BountyReportQueuePk;
+
+    public static string BountyReportQueueSkValue(DateTimeOffset at, string bountyId, string reporterId) =>
+        $"{FormatInstant(at)}#{Require(bountyId)}#{Require(reporterId)}";
+
     // ─── Conversation ───────────────────────────────────────────────────────────
 
     /// <summary>

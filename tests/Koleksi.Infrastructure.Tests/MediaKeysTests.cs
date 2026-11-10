@@ -144,7 +144,8 @@ public sealed class MediaKeysTests
             throw new NotSupportedException();
 
         public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
-            string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct) =>
+            string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct,
+            MediaPurpose purpose = MediaPurpose.ListingPhoto) =>
             throw new NotSupportedException();
 
         public string PublicUrl(string storageKey, PhotoSize size = PhotoSize.Original) =>

@@ -27,6 +27,7 @@ internal static class OrderItem
     private const string FeePercentAttr = "feePercent";
     private const string SourceAttr = "source";
     private const string SourceReferenceAttr = "sourceRef";
+    private const string BountyIdAttr = "bountyId";
     private const string PaymentDueAtAttr = "paymentDueAt";
     private const string TrackingCheckedAtAttr = "trackingCheckedAt";
 
@@ -124,6 +125,7 @@ internal static class OrderItem
             // written before they were kept, which read as a plain sale due 15 minutes after creation.
             [SourceAttr] = Attr.EnumValue(order.Source),
             [SourceReferenceAttr] = Attr.SOrNull(order.SourceReference),
+            [BountyIdAttr] = Attr.SOrNull(order.BountyId),
             [PaymentDueAtAttr] = Attr.Instant(order.PaymentDueAt),
             [TrackingCheckedAtAttr] = Attr.InstantOrNull(order.TrackingCheckedAt),
 
@@ -228,7 +230,8 @@ internal static class OrderItem
                     : OrderSource.FixedPrice,
             paymentDueAt: item.GetInstantOrNull(PaymentDueAtAttr),
             trackingCheckedAt: item.GetInstantOrNull(TrackingCheckedAtAttr),
-            sourceReference: item.GetStringOrNull(SourceReferenceAttr));
+            sourceReference: item.GetStringOrNull(SourceReferenceAttr),
+            bountyId: item.GetStringOrNull(BountyIdAttr));
     }
 
     private static Dictionary<string, AttributeValue> ShipToToMap(ShippingAddress address) =>

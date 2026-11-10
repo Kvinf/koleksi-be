@@ -125,6 +125,13 @@ public sealed class Order
     public string? SourceReference { get; private set; }
 
     /// <summary>
+    /// The Dicari (bounty) this order settles, for traceability and the "Dari Dicari DCR-xxxxxx" label; set
+    /// only for <see cref="OrderSource.BountyOffer"/>. It is the bounty's own id, never the order's, the
+    /// offer's or the proposal's.
+    /// </summary>
+    public string? BountyId { get; private set; }
+
+    /// <summary>
     /// When an unpaid order stops being payable and its stock goes back on sale: fifteen minutes after
     /// checkout for a sale or an accepted offer, thirty minutes after the close for an auction win.
     /// Orders stored before this was kept read as created + <see cref="PaymentWindow"/>.
@@ -200,7 +207,8 @@ public sealed class Order
         IClock clock,
         OrderSource source = OrderSource.FixedPrice,
         DateTimeOffset? paymentDueAt = null,
-        string? sourceReference = null)
+        string? sourceReference = null,
+        string? bountyId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(buyerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
@@ -239,6 +247,7 @@ public sealed class Order
         order.FeePercentSnapshot = PlatformFeePercent;
         order.Source = source;
         order.SourceReference = sourceReference;
+        order.BountyId = source == OrderSource.BountyOffer ? bountyId : null;
         if (paymentDueAt is { } due)
         {
             if (due <= now)
@@ -273,13 +282,15 @@ public sealed class Order
         OrderSource source = OrderSource.FixedPrice,
         DateTimeOffset? paymentDueAt = null,
         DateTimeOffset? trackingCheckedAt = null,
-        string? sourceReference = null)
+        string? sourceReference = null,
+        string? bountyId = null)
     {
         var order = new Order(id, orderNumber, buyerId, sellerId, shipTo, courier, createdAt)
         {
             FeePercentSnapshot = platformFeePercent,
             Source = source,
             SourceReference = sourceReference,
+            BountyId = source == OrderSource.BountyOffer ? bountyId : null,
             PaymentDueAt = paymentDueAt ?? createdAt + PaymentWindow,
             TrackingCheckedAt = trackingCheckedAt,
             EscrowState = escrowState,
@@ -611,6 +622,13 @@ public enum OrderSource
 
     /// <summary>An auction the buyer won or bought out. Not paying for it is a violation.</summary>
     AuctionWin = 2,
+
+    /// <summary>
+    /// An offer born accepted from a Dicari proposal. Treated like <see cref="AcceptedOffer"/> for standing
+    /// (not paying is a violation) but kept apart so the order can be labelled and traced to its bounty, and
+    /// so its violation key is distinct from a nego's.
+    /// </summary>
+    BountyOffer = 3,
 }
 
 /// <summary>One line of an order, snapshotted at purchase time.</summary>

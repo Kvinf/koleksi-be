@@ -67,7 +67,7 @@ public sealed class CheckoutHandler(
             return CheckoutResult.NotFound;
         }
 
-        var (sellerId, line, spendingOffer, stock, source, dueAt, sourceReference) = resolved;
+        var (sellerId, line, spendingOffer, stock, source, dueAt, sourceReference, bountyId) = resolved;
 
         // A banned seller cannot be bought from, whatever browse still shows.
         await standing.EnsureNotBannedAsync(sellerId, ct).ConfigureAwait(false);
@@ -78,7 +78,7 @@ public sealed class CheckoutHandler(
 
         // Created with its own deadline: fifteen minutes for a sale or an accepted offer, and for an
         // auction win whatever is left of the winner's thirty minutes from the close.
-        var order = Order.Create(buyerId, sellerId, [line], shipTo, courier, clock, source, dueAt, sourceReference);
+        var order = Order.Create(buyerId, sellerId, [line], shipTo, courier, clock, source, dueAt, sourceReference, bountyId);
 
         await PendingOrderLimit.EnsureRoomAsync(orders, clock, buyerId, [order], ct).ConfigureAwait(false);
 
@@ -218,6 +218,13 @@ public sealed class CheckoutHandler(
                         throw DomainException.For("offer.already_used", "This offer has already been used for an order.");
                     }
 
+                    // A Dicari deal is not reopened: its 48 hours are the whole deal, and the Dicari is handed back
+                    // to its buyer by the sweep once the order has died.
+                    if (offer.Origin == OfferOrigin.Bounty)
+                    {
+                        throw DomainException.For("offer.expired", "This offer has expired.");
+                    }
+
                     var version = offer.Version;
                     offer.ReopenAfterUnpaidOrder(clock);
                     try
@@ -250,7 +257,8 @@ public sealed class CheckoutHandler(
 
                 return new Resolved(
                     offer.SellerId, LineFor(listing, offer.CurrentAmount, 1), offer, listing.Stock,
-                    OrderSource.AcceptedOffer, clock.UtcNow + Order.PaymentWindow, offer.Id);
+                    offer.Origin == OfferOrigin.Bounty ? OrderSource.BountyOffer : OrderSource.AcceptedOffer,
+                    clock.UtcNow + Order.PaymentWindow, offer.Id, offer.Origin == OfferOrigin.Bounty ? offer.BountyId : null);
             }
 
             case CheckoutSource.AuctionWin:
@@ -292,7 +300,7 @@ public sealed class CheckoutHandler(
 
     private sealed record Resolved(
         string SellerId, OrderLine Line, Offer? SpendingOffer, int Stock, OrderSource Source, DateTimeOffset DueAt,
-        string? SourceReference);
+        string? SourceReference, string? BountyId = null);
 }
 
 /// <param name="Source">Which price and seller this checkout resolves from.</param>

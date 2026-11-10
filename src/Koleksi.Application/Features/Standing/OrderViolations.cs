@@ -18,6 +18,10 @@ internal static class OrderViolations
         {
             OrderSource.AuctionWin => (ViolationType.AuctionWinNotPaid, $"auction:{order.SourceReference ?? order.Id}"),
             OrderSource.AcceptedOffer => (ViolationType.AcceptedOfferNotPaid, $"offer:{order.SourceReference ?? order.Id}"),
+
+            // A Dicari checkout is the same commitment as an accepted nego, but its key is its own so one
+            // broken bounty deal is one warning and can never collide with an offer's.
+            OrderSource.BountyOffer => (ViolationType.AcceptedOfferNotPaid, $"bounty:{order.SourceReference ?? order.Id}"),
             _ => null,
         };
     }

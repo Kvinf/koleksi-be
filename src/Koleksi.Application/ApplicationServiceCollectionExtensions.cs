@@ -1,3 +1,4 @@
+using Koleksi.Application.Features.Bounties;
 using Koleksi.Application.Abstractions;
 using Koleksi.Application.Features.Auctions;
 using Koleksi.Application.Features.Cart;
@@ -60,6 +61,17 @@ public static class ApplicationServiceCollectionExtensions
         services.AddScoped<WithdrawOfferHandler>();
         services.AddScoped<OfferViews>();
         services.AddScoped<OfferNotifier>();
+        services.AddScoped<BountyNotifier>();
+        services.AddScoped<BountyDeals>();
+        services.AddScoped<BountyViews>();
+        services.AddScoped<PostBountyHandler>();
+        services.AddScoped<EditBountyHandler>();
+        services.AddScoped<CloseBountyHandler>();
+        services.AddScoped<ReportBountyHandler>();
+        services.AddScoped<MakeProposalHandler>();
+        services.AddScoped<WithdrawProposalHandler>();
+        services.AddScoped<DeclineProposalHandler>();
+        services.AddScoped<AcceptProposalHandler>();
 
         services.AddScoped<StartConversationHandler>();
         services.AddScoped<SendMessageHandler>();
@@ -105,6 +117,7 @@ public static class ApplicationServiceCollectionExtensions
         services.AddSingleton<BanStatusCache>();
         services.AddScoped<AccountStandingService>();
         services.AddScoped<CancelUnpaidOrdersHandler>();
+        services.AddScoped<ExpireDueBountiesHandler>();
         services.AddScoped<ReleaseDueEscrowHandler>();
         services.AddScoped<TrackShipmentsHandler>();
         services.AddScoped<SendPendingPayoutsHandler>();
@@ -142,6 +155,10 @@ public static class ApplicationServiceCollectionExtensions
         services.AddScoped<Features.Admin.ListHolidaysHandler>();
         services.AddScoped<Features.Admin.AddHolidayHandler>();
         services.AddScoped<Features.Admin.RemoveHolidayHandler>();
+        services.AddScoped<Features.Admin.ListReportedBountiesHandler>();
+        services.AddScoped<Features.Admin.GetReportedBountyHandler>();
+        services.AddScoped<Features.Admin.RemoveBountyHandler>();
+        services.AddScoped<Features.Admin.DismissBountyReportsHandler>();
 
         return services;
     }

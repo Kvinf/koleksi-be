@@ -30,6 +30,7 @@ public sealed partial class SweepOrchestrator(
     SendPendingPayoutsHandler sendPayouts,
     ExpireAuctionPaymentsHandler expireAuctionPayments,
     CancelUnpaidOrdersHandler cancelUnpaid,
+    ExpireDueBountiesHandler expireBounties,
     ILogger<SweepOrchestrator> logger)
 {
     public Task<SweepSummary> RunAsync(CancellationToken ct) => RunAsync(new SweepBudget(), ct);
@@ -45,6 +46,7 @@ public sealed partial class SweepOrchestrator(
         SendPendingPayoutsResult? paidOut = null;
         ExpireAuctionPaymentsResult? lapsedWinners = null;
         CancelUnpaidOrdersResult? cancelled = null;
+        ExpireDueBountiesResult? bountiesSettled = null;
 
         try
         {
@@ -106,17 +108,28 @@ public sealed partial class SweepOrchestrator(
             LogDutyFailed(logger, "cancel-unpaid-orders", failure);
         }
 
+        try
+        {
+            bountiesSettled = await expireBounties.RunAsync(budget, ct).ConfigureAwait(false);
+        }
+        catch (Exception failure) when (failure is not OperationCanceledException)
+        {
+            errors++;
+            LogDutyFailed(logger, "expire-bounties", failure);
+        }
+
         var summary = new SweepSummary(
             ClosedAuctions: closed?.Sold ?? 0,
             EndedWithoutSale: closed?.Unsold ?? 0,
             CancelledOrders: cancelled?.Cancelled ?? 0,
             ReleasedOrders: released?.Released ?? 0,
             Errors: errors + (closed?.Errors ?? 0) + (released?.Errors ?? 0) + (cancelled?.Errors ?? 0)
-                + (tracked?.Errors ?? 0) + (paidOut?.Errors ?? 0) + (lapsedWinners?.Errors ?? 0),
+                + (tracked?.Errors ?? 0) + (paidOut?.Errors ?? 0) + (lapsedWinners?.Errors ?? 0) + (bountiesSettled?.Errors ?? 0),
             DurationMs: (long)budget.Elapsed.TotalMilliseconds,
             DeliveredOrders: tracked?.Delivered ?? 0,
             PaidOutOrders: paidOut?.Sent ?? 0,
-            LapsedAuctionPayments: lapsedWinners?.Lapsed ?? 0);
+            LapsedAuctionPayments: lapsedWinners?.Lapsed ?? 0,
+            ExpiredBounties: bountiesSettled?.Settled ?? 0);
 
         LogCompleted(
             logger, summary.ClosedAuctions, summary.EndedWithoutSale, summary.CancelledOrders,

@@ -1,4 +1,5 @@
 using Koleksi.Application.Abstractions;
+using Koleksi.Application.Features.Bounties;
 using Koleksi.Application.Features.Standing;
 using Koleksi.Domain.Common;
 using Koleksi.Domain.Orders;
@@ -36,7 +37,8 @@ public sealed partial class CancelOrderHandler(
     AccountStandingService standing,
     ICurrentUser currentUser,
     IClock clock,
-    ILogger<CancelOrderHandler> logger)
+    ILogger<CancelOrderHandler> logger,
+    BountyDeals? bountyDeals = null)
 {
     public async Task<CancelOrderOutcome> HandleAsync(string orderId, CancellationToken ct)
     {
@@ -76,6 +78,12 @@ public sealed partial class CancelOrderHandler(
         // Walking away from a deal both sides had agreed to (an accepted nego offer, an auction won) is a
         // broken commitment, the same as letting its time run out. A plain sale is not.
         await OrderViolations.RecordIfCommitmentAsync(standing, order, ct).ConfigureAwait(false);
+
+        // A Dicari deal cannot be checked out again, so the Dicari goes back to its buyer at once.
+        if (bountyDeals is not null)
+        {
+            await bountyDeals.ReleaseAfterOrderDiedAsync(order, ct).ConfigureAwait(false);
+        }
 
         return new CancelOrderOutcome(true, order.Id);
     }

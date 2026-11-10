@@ -46,7 +46,8 @@ internal sealed class S3MediaStorage(IAmazonS3 s3, MediaOptions options) : IMedi
     }
 
     public Task<PhotoUploadGrantSet> CreatePhotoUploadGrantSetAsync(
-        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct)
+        string ownerId, PhotoUploadSpec original, PhotoUploadSpec large, PhotoUploadSpec small, CancellationToken ct,
+        MediaPurpose purpose = MediaPurpose.ListingPhoto)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
         ArgumentNullException.ThrowIfNull(original);
@@ -65,12 +66,12 @@ internal sealed class S3MediaStorage(IAmazonS3 s3, MediaOptions options) : IMedi
         ValidateUploadSize(large.ContentLength);
         ValidateUploadSize(small.ContentLength);
 
-        var bucket = BucketFor(MediaPurpose.ListingPhoto);
+        var bucket = BucketFor(purpose);
 
         // No extension on the base key or the three it derives — Content-Type, signed into
         // each grant below and set on the object at PUT time, is what a browser actually
         // renders by; the key itself never needs to spell out a format.
-        var key = BuildKeyWithExtension(MediaPurpose.ListingPhoto, ownerId, string.Empty);
+        var key = BuildKeyWithExtension(purpose, ownerId, string.Empty);
 
         return Task.FromResult(new PhotoUploadGrantSet(
             StorageKey: key,
@@ -170,12 +171,12 @@ internal sealed class S3MediaStorage(IAmazonS3 s3, MediaOptions options) : IMedi
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
 
-        if (PurposeFromKey(storageKey) != MediaPurpose.ListingPhoto)
+        if (PurposeFromKey(storageKey) is not { } photoSetPurpose || !MediaKeys.IsPhotoSet(photoSetPurpose))
         {
             return false;
         }
 
-        var bucket = BucketFor(MediaPurpose.ListingPhoto);
+        var bucket = BucketFor(photoSetPurpose);
 
         // A photo stored before the three-size layout is one object, not a prefix: check that one.
         if (MediaKeys.IsLegacyListingPhotoKey(storageKey))
@@ -239,7 +240,7 @@ internal sealed class S3MediaStorage(IAmazonS3 s3, MediaOptions options) : IMedi
         // needs the size folded into the path.
         // A legacy listing photo (a single object with an extension, from before the three sizes)
         // has no size folders: every size resolves to that one object rather than to a 404.
-        var key = purpose == MediaPurpose.ListingPhoto && !MediaKeys.IsLegacyListingPhotoKey(storageKey)
+        var key = purpose is { } photoPurpose && MediaKeys.IsPhotoSet(photoPurpose) && !MediaKeys.IsLegacyListingPhotoKey(storageKey)
             ? $"{storageKey}/{SizeSegment(size)}"
             : storageKey;
 
@@ -287,6 +288,7 @@ internal sealed class S3MediaStorage(IAmazonS3 s3, MediaOptions options) : IMedi
             "shipping" => MediaPurpose.ShippingProof,
             "reviews" => MediaPurpose.ReviewPhoto,
             "identity" => MediaPurpose.IdentityDocument,
+            "bounties" => MediaPurpose.BountyPhoto,
             _ => null,
         };
 

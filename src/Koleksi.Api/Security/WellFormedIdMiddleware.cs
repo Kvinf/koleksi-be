@@ -8,7 +8,7 @@ namespace Koleksi.Api.Security;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Orders, offers and listings are 26-character <see cref="EntityId"/>s; a conversation's id is the 32 hex characters
+/// Orders, offers, Dicari, proposals and listings are 26-character <see cref="EntityId"/>s; a conversation's id is the 32 hex characters
 /// <c>Conversation.IdFor</c> derives. The id lands in a DynamoDB key, and DynamoDB refuses a partition key over
 /// 2,048 bytes, so a signed-in caller who sent a 3,000 character id used to get an unhandled 500 and an error-level log
 /// line. Such a value names nothing, which is exactly what a 404 says, so it is refused here before it reaches a
@@ -23,7 +23,7 @@ namespace Koleksi.Api.Security;
 /// </remarks>
 internal sealed class WellFormedIdMiddleware(RequestDelegate next)
 {
-    private static readonly string[] EntityIdRouteKeys = ["orderId", "offerId", "listingId", "id"];
+    private static readonly string[] EntityIdRouteKeys = ["orderId", "offerId", "listingId", "id", "bountyId", "proposalId"];
 
     public Task InvokeAsync(HttpContext context)
     {

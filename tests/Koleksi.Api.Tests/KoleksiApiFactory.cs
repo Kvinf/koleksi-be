@@ -65,6 +65,7 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
     {
         Idempotency = new FakeIdempotencyStore(Clock);
         VerificationThrottle = new FakeVerificationThrottle(Clock);
+        BountyReports = new FakeBountyModerationStore(Bounties);
         Holds = new FakeListingHoldStore(Clock);
         PaymentOrphans = new FakePaymentOrphanStore();
         ShippingClaims = new FakeShippingClaimStore();
@@ -103,6 +104,10 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
     public FakeVerificationThrottle VerificationThrottle { get; }
 
     public FakeOfferRepository Offers { get; } = new();
+
+    public FakeBountyRepository Bounties { get; } = new();
+
+    public FakeBountyModerationStore BountyReports { get; }
 
     public FakeConversationRepository Conversations { get; } = new();
 
@@ -283,6 +288,8 @@ public class KoleksiApiFactory : WebApplicationFactory<Program>
         Replace<IVerificationThrottle>(services, VerificationThrottle);
 
         Replace<IOfferRepository>(services, Offers);
+        Replace<IBountyRepository>(services, Bounties);
+        Replace<IBountyModerationStore>(services, BountyReports);
         Replace<IConversationRepository>(services, Conversations);
         Replace<IOrderRepository>(services, Orders);
         Replace<IOrderSweepBackfill>(services, OrderSweepBackfill);

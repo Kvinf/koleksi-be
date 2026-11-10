@@ -27,6 +27,19 @@ public enum OfferStatus
     CheckedOut = 6,
 }
 
+/// <summary>Where an offer came from. Decides how the order made from it is labelled and recorded.</summary>
+public enum OfferOrigin
+{
+    /// <summary>A buyer's offer on a nego listing. What every offer stored before bounties was.</summary>
+    Nego = 0,
+
+    /// <summary>
+    /// Born accepted when a buyer accepts a seller's proposal on one of their Dicari (bounties). The
+    /// order made from it is a <c>BountyOffer</c>, not an accepted nego.
+    /// </summary>
+    Bounty = 1,
+}
+
 /// <summary>Which side of an offer a user is on.</summary>
 public enum OfferParty
 {
@@ -158,6 +171,15 @@ public sealed class Offer
     /// <summary>The order created from this offer, once checked out.</summary>
     public string? OrderId { get; private set; }
 
+    /// <summary>Where the offer came from. Rows stored before bounties existed have no origin and read as <see cref="OfferOrigin.Nego"/>.</summary>
+    public OfferOrigin Origin { get; private set; } = OfferOrigin.Nego;
+
+    /// <summary>The Dicari this offer settles; set only when <see cref="Origin"/> is <see cref="OfferOrigin.Bounty"/>.</summary>
+    public string? BountyId { get; private set; }
+
+    /// <summary>The accepted proposal behind this offer; set only when <see cref="Origin"/> is <see cref="OfferOrigin.Bounty"/>.</summary>
+    public string? ProposalId { get; private set; }
+
     public OfferStatus Status { get; private set; }
     public DateTimeOffset CreatedAt { get; }
 
@@ -268,6 +290,64 @@ public sealed class Offer
         return offer;
     }
 
+    /// <summary>
+    /// The offer a buyer's acceptance of a seller's Dicari proposal produces: the seller's listing at the
+    /// proposed price, already <see cref="OfferStatus.Accepted"/>, so the buyer can check out at once.
+    /// </summary>
+    /// <remarks>
+    /// A separate factory rather than a bent <see cref="Create"/>: a buyer's offer must be below asking and
+    /// above the floor and waits for the seller, while a proposal is the seller's own price (at or below the
+    /// listing price, which the proposal already enforced) and the buyer's acceptance is the last word. It
+    /// gets the ordinary <see cref="CheckoutWindow"/>, and from here on the existing checkout, payment
+    /// deadline, stock hold, escrow and standing rules apply unchanged.
+    /// </remarks>
+    public static Offer CreateAcceptedFromBounty(
+        string listingId,
+        string buyerId,
+        string sellerId,
+        Money proposedPrice,
+        Money listingPrice,
+        string bountyId,
+        string proposalId,
+        IClock clock,
+        string? buyerUsername = null,
+        string? sellerUsername = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(listingId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(buyerId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sellerId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(bountyId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(proposalId);
+        ArgumentNullException.ThrowIfNull(clock);
+
+        if (string.Equals(buyerId, sellerId, StringComparison.Ordinal))
+        {
+            throw DomainException.For("offer.self_offer", "You cannot make an offer on your own listing.");
+        }
+
+        if (proposedPrice.IsZero || proposedPrice > listingPrice)
+        {
+            throw DomainException.For(
+                "offer.invalid_amount", "A proposal cannot be priced at zero or above the listing price.");
+        }
+
+        var now = clock.UtcNow;
+
+        // A fresh id: never the bounty's or the proposal's, so the checkout URL (which carries this id)
+        // reveals neither and the three can never be confused for one another.
+        return new Offer(EntityId.New(now), listingId, buyerId, sellerId, proposedPrice, listingPrice, null, now)
+        {
+            BuyerUsername = buyerUsername,
+            SellerUsername = sellerUsername,
+            Origin = OfferOrigin.Bounty,
+            BountyId = bountyId,
+            ProposalId = proposalId,
+            Status = OfferStatus.Accepted,
+            RespondedAt = now,
+            ExpiresAt = now + CheckoutWindow,
+        };
+    }
+
     public static Offer Rehydrate(
         string id,
         string listingId,
@@ -284,7 +364,10 @@ public sealed class Offer
         DateTimeOffset createdAt,
         DateTimeOffset expiresAt,
         DateTimeOffset? respondedAt,
-        long version) =>
+        long version,
+        OfferOrigin origin = OfferOrigin.Nego,
+        string? bountyId = null,
+        string? proposalId = null) =>
         new(id, listingId, buyerId, sellerId, amount, askingPrice, message, createdAt)
         {
             CounterAmount = counterAmount,
@@ -295,6 +378,9 @@ public sealed class Offer
             ExpiresAt = expiresAt,
             RespondedAt = respondedAt,
             Version = version,
+            Origin = origin,
+            BountyId = origin == OfferOrigin.Bounty ? bountyId : null,
+            ProposalId = origin == OfferOrigin.Bounty ? proposalId : null,
         };
 
     /// <summary>
@@ -444,6 +530,21 @@ public sealed class Offer
 
         Status = clock.UtcNow >= ExpiresAt ? OfferStatus.Expired : OfferStatus.Accepted;
         OrderId = null;
+        Version++;
+    }
+
+    /// <summary>
+    /// Retires an accepted Dicari offer whose deal was rolled back before anyone could pay for it. Does nothing to any
+    /// other offer, or to one already used for an order.
+    /// </summary>
+    public void CancelUnusedBountyOffer()
+    {
+        if (Origin != OfferOrigin.Bounty || Status != OfferStatus.Accepted)
+        {
+            return;
+        }
+
+        Status = OfferStatus.Expired;
         Version++;
     }
 

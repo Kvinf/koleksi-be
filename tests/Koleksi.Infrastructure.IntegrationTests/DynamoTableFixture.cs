@@ -40,6 +40,8 @@ public sealed class DynamoTableFixture : IAsyncLifetime
 
     public IOfferRepository Offers { get; private set; } = null!;
 
+    public IBountyRepository Bounties { get; private set; } = null!;
+
     public IOrderRepository Orders { get; private set; } = null!;
 
     public IConversationRepository Conversations { get; private set; } = null!;
@@ -98,6 +100,7 @@ public sealed class DynamoTableFixture : IAsyncLifetime
         Listings = new DynamoListingRepository(_client, options);
         Auctions = new DynamoAuctionRepository(_client, options);
         Offers = new DynamoOfferRepository(_client, options);
+        Bounties = new DynamoBountyRepository(_client, options);
         Orders = new DynamoOrderRepository(_client, options);
         Conversations = new DynamoConversationRepository(_client, options);
         ShippingClaims = new DynamoShippingClaimStore(_client, options);

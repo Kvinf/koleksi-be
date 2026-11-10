@@ -515,6 +515,19 @@ public sealed class SweepHandlerTests
 
         public FakeOrderRepository Orders { get; } = new();
 
+        public FakeBountyRepository Bounties { get; } = new();
+
+        public FakeOfferRepository Offers { get; } = new();
+
+        public Koleksi.Application.Features.Bounties.BountyDeals BountyDealsService => new(
+            Bounties, Offers, Orders,
+            new Koleksi.Application.Features.Bounties.BountyNotifier(
+                Realtime, NullLogger<Koleksi.Application.Features.Bounties.BountyNotifier>.Instance),
+            Clock, NullLogger<Koleksi.Application.Features.Bounties.BountyDeals>.Instance);
+
+        public ExpireDueBountiesHandler ExpireBounties => new(
+            Bounties, BountyDealsService, Clock, NullLogger<ExpireDueBountiesHandler>.Instance);
+
         public FakeListingHoldStore Holds { get; }
 
         public AuctionCloseAnnouncer Announcer => new(
@@ -556,7 +569,8 @@ public sealed class SweepHandlerTests
             Auctions, Listings, Standing, Clock, NullLogger<ExpireAuctionPaymentsHandler>.Instance);
 
         public SweepOrchestrator Orchestrator => new(
-            Close, Track, Release, SendPayouts, ExpireAuctionPayments, Cancel, NullLogger<SweepOrchestrator>.Instance);
+            Close, Track, Release, SendPayouts, ExpireAuctionPayments, Cancel, ExpireBounties,
+            NullLogger<SweepOrchestrator>.Instance);
 
         /// <summary>A live auction that started now and runs for <paramref name="duration"/>.</summary>
         public Lot SeedAuction(TimeSpan duration, long? bidRupiah, Money? reserve = null)

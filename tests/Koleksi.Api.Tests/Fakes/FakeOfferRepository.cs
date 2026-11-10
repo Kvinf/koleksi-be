@@ -151,5 +151,5 @@ public sealed class FakeOfferRepository : FakeAdapter, IOfferRepository
     private static Offer Copy(Offer offer) => Offer.Rehydrate(
         offer.Id, offer.ListingId, offer.BuyerId, offer.SellerId, offer.Amount, offer.CounterAmount, offer.AskingPrice,
         offer.Message, offer.BuyerUsername, offer.SellerUsername, offer.OrderId, offer.Status, offer.CreatedAt,
-        offer.ExpiresAt, offer.RespondedAt, offer.Version);
+        offer.ExpiresAt, offer.RespondedAt, offer.Version, offer.Origin, offer.BountyId, offer.ProposalId);
 }

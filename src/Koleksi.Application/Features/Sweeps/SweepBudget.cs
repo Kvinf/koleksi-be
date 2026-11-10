@@ -61,4 +61,5 @@ public sealed record SweepSummary(
     long DurationMs,
     int DeliveredOrders = 0,
     int PaidOutOrders = 0,
-    int LapsedAuctionPayments = 0);
+    int LapsedAuctionPayments = 0,
+    int ExpiredBounties = 0);

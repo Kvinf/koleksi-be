@@ -46,6 +46,7 @@ public sealed partial class ConfirmOrderPaymentHandler(
     IPaymentGateway payments,
     IPaymentOrphanStore orphans,
     IIdempotencyStore idempotency,
+    Koleksi.Application.Features.Bounties.BountyDeals bountyDeals,
     IClock clock,
     ILogger<ConfirmOrderPaymentHandler> logger)
 {
@@ -155,6 +156,12 @@ public sealed partial class ConfirmOrderPaymentHandler(
             foreach (var line in order.Lines)
             {
                 await MarkListingSoldAsync(order, line, firstSettlement, notification, ct).ConfigureAwait(false);
+            }
+
+            // A Dicari deal is done once its order is paid. Best effort and idempotent; the sweep repeats the check.
+            if (order is { Source: OrderSource.BountyOffer, BountyId: { } bountyId })
+            {
+                await bountyDeals.FulfilAsync(bountyId, ct).ConfigureAwait(false);
             }
 
             return ConfirmOrderPaymentResult.Acknowledged;

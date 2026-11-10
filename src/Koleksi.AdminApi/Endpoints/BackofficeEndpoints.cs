@@ -102,6 +102,40 @@ internal static class BackofficeEndpoints
             .RequireAuthorization(AdminCapabilities.HolidaysEdit)
             .RequireRateLimiting(AdminRateLimits.Write);
 
+        group.MapGet("/bounties/reported", async (ListReportedBountiesHandler handler, CancellationToken ct) =>
+                Results.Ok(await handler.HandleAsync(ct).ConfigureAwait(false)))
+            .RequireAuthorization(AdminCapabilities.BountiesRead);
+
+        group.MapGet("/bounties/{bountyId}", async (string bountyId, GetReportedBountyHandler handler, CancellationToken ct) =>
+                Results.Ok(await handler.HandleAsync(bountyId, ct).ConfigureAwait(false)))
+            .RequireAuthorization(AdminCapabilities.BountiesRead);
+
+        group.MapPost("/bounties/{bountyId}/remove", async (
+                string bountyId,
+                [FromBody] RemoveBountyRequest body,
+                HttpRequest request,
+                RemoveBountyHandler handler,
+                CancellationToken ct) =>
+            {
+                await handler.HandleAsync(bountyId, body, IdempotencyHeader.Read(request), ct).ConfigureAwait(false);
+                return Results.NoContent();
+            })
+            .RequireAuthorization(AdminCapabilities.BountiesModerate)
+            .RequireRateLimiting(AdminRateLimits.Write);
+
+        group.MapPost("/bounties/{bountyId}/dismiss", async (
+                string bountyId,
+                [FromBody] DismissBountyReportsRequest body,
+                HttpRequest request,
+                DismissBountyReportsHandler handler,
+                CancellationToken ct) =>
+            {
+                await handler.HandleAsync(bountyId, body, IdempotencyHeader.Read(request), ct).ConfigureAwait(false);
+                return Results.NoContent();
+            })
+            .RequireAuthorization(AdminCapabilities.BountiesModerate)
+            .RequireRateLimiting(AdminRateLimits.Write);
+
         return app;
     }
 }

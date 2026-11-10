@@ -107,7 +107,7 @@ public sealed class OfferViews(
             // A checked-out offer whose order was never paid and has died is the buyer's deal
             // again (see Offer.ReopenAfterUnpaidOrder). Shown that way here so they can resume;
             // the checkout itself makes it official.
-            if (status == OfferStatus.CheckedOut && role == OfferParty.Buyer
+            if (status == OfferStatus.CheckedOut && role == OfferParty.Buyer && offer.Origin != OfferOrigin.Bounty
                 && await OrderIsDeadAsync(offer, ct).ConfigureAwait(false))
             {
                 status = clock.UtcNow >= offer.ExpiresAt ? OfferStatus.Expired : OfferStatus.Accepted;

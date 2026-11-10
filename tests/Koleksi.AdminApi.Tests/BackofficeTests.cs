@@ -39,6 +39,10 @@ public sealed class BackofficeTests
         { "admin.holidays.read", "GET", "/api/admin/holidays", null },
         { "admin.holidays.edit", "POST", "/api/admin/holidays", """{"date":"2026-12-31","name":"Tes","kind":"national"}""" },
         { "admin.holidays.edit", "POST", "/api/admin/holidays/2026-01-01/remove", "{}" },
+        { "admin.bounties.read", "GET", "/api/admin/bounties/reported", null },
+        { "admin.bounties.read", "GET", "/api/admin/bounties/0000000000000000000000000A", null },
+        { "admin.bounties.moderate", "POST", "/api/admin/bounties/0000000000000000000000000A/remove", """{"reason":"alasan yang cukup"}""" },
+        { "admin.bounties.moderate", "POST", "/api/admin/bounties/0000000000000000000000000A/dismiss", "{}" },
     };
 
     [Theory]

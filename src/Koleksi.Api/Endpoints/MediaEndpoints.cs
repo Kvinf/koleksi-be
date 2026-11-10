@@ -46,6 +46,13 @@ internal static class MediaEndpoints
             return Results.BadRequest(new { code = "media.invalid_request" });
         }
 
+        // Listing photos by default; a Dicari reference photo is the only other three-size purpose.
+        var purpose = request.Purpose ?? MediaPurpose.ListingPhoto;
+        if (!MediaKeys.IsPhotoSet(purpose))
+        {
+            return Results.BadRequest(new { code = "media.invalid_request" });
+        }
+
         var grants = await media.CreatePhotoUploadGrantSetAsync(
             user.RequireUserId(),
             new PhotoUploadSpec(request.OriginalContentType, request.OriginalContentLength),
@@ -54,7 +61,8 @@ internal static class MediaEndpoints
             // directUpload.ts — so their content type is not part of the request at all.
             new PhotoUploadSpec("image/jpeg", request.LargeContentLength),
             new PhotoUploadSpec("image/jpeg", request.SmallContentLength),
-            ct).ConfigureAwait(false);
+            ct,
+            purpose).ConfigureAwait(false);
 
         static object ToResponse(UploadGrant grant) => new
         {
@@ -74,7 +82,8 @@ internal static class MediaEndpoints
     }
 
     private sealed record PhotoUploadGrantsRequest(
-        string OriginalContentType, long OriginalContentLength, long LargeContentLength, long SmallContentLength);
+        string OriginalContentType, long OriginalContentLength, long LargeContentLength, long SmallContentLength,
+        MediaPurpose? Purpose = null);
 
     private static async Task<IResult> CreateUploadGrantAsync(
         UploadGrantRequest request, ICurrentUser user, IMediaStorage media, FeaturesOptions features, CancellationToken ct)

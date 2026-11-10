@@ -347,6 +347,7 @@ internal static class OrderEndpoints
         title = order.Lines.Count > 0 ? order.Lines[0].Title : null,
         grandTotalRupiah = order.GrandTotal.Rupiah,
         escrowState = order.EscrowState.ToString(),
+        bountyCode = order.BountyId is null ? null : Koleksi.Domain.Bounties.BountyCode.For(order.BountyId),
         order.CreatedAt,
     };
 
@@ -417,6 +418,8 @@ internal static class OrderEndpoints
         // parcel (when it is not, only the buyer's confirmation releases the money).
         paymentDueAt = order.PaymentDueAt,
         source = order.Source.ToString(),
+        bountyId = order.BountyId,
+        bountyCode = order.BountyId is null ? null : Koleksi.Domain.Bounties.BountyCode.For(order.BountyId),
         courierTracking,
 
         // What the seller will receive when escrow releases. Only the seller needs it; the buyer's view omits it.

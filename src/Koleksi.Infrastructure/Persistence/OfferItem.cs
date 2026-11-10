@@ -25,6 +25,9 @@ internal static class OfferItem
     private const string ExpiresAtAttr = "expiresAt";
     private const string RespondedAtAttr = "respondedAt";
     private const string VersionAttr = "version";
+    private const string OriginAttr = "origin";
+    private const string BountyIdAttr = "bountyId";
+    private const string ProposalIdAttr = "proposalId";
 
     public static string VersionAttribute => VersionAttr;
 
@@ -64,6 +67,11 @@ internal static class OfferItem
             [ExpiresAtAttr] = Attr.Instant(offer.ExpiresAt),
             [RespondedAtAttr] = Attr.InstantOrNull(offer.RespondedAt),
             [VersionAttr] = Attr.N(offer.Version),
+
+            // Absent on rows written before bounties existed, which read as a nego offer (no backfill).
+            [OriginAttr] = Attr.EnumValue(offer.Origin),
+            [BountyIdAttr] = Attr.SOrNull(offer.BountyId),
+            [ProposalIdAttr] = Attr.SOrNull(offer.ProposalId),
 
             [DynamoTable.SellerPk] = Attr.S(DynamoTable.SellerPkValue(offer.SellerId)),
             [DynamoTable.SellerSk] = Attr.S(
@@ -106,7 +114,13 @@ internal static class OfferItem
             createdAt: item.GetInstant(CreatedAtAttr),
             expiresAt: item.GetInstant(ExpiresAtAttr),
             respondedAt: item.GetInstantOrNull(RespondedAtAttr),
-            version: item.GetLongOrDefault(VersionAttr));
+            version: item.GetLongOrDefault(VersionAttr),
+            origin: item.TryGetValue(OriginAttr, out var origin) && origin.S is { Length: > 0 } originName
+                && Enum.TryParse<OfferOrigin>(originName, out var parsedOrigin)
+                    ? parsedOrigin
+                    : OfferOrigin.Nego,
+            bountyId: item.GetStringOrNull(BountyIdAttr),
+            proposalId: item.GetStringOrNull(ProposalIdAttr));
     }
 }
 
